@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     'corsheaders',
     'drf_spectacular',
     'accounts',
+    'questions',
 ]
 
 AUTH_USER_MODEL = 'accounts.User'
