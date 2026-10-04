@@ -5,7 +5,7 @@ A multiplayer quiz-territory game: Django + Django REST Framework backend, React
 ## Project layout
 
 ```text
-backend/    Django project (config/, accounts/, questions/)
+backend/    Django project (config/, accounts/, questions/, games/)
 frontend/   React + Vite app
 ```
 
@@ -58,7 +58,7 @@ Open http://localhost:5173. The Vite dev server proxies `/api` to Django on port
 ## Tests
 
 ```bash
-python backend/manage.py test accounts questions
+python backend/manage.py test accounts questions games
 ```
 
 ## Question bank
@@ -73,3 +73,9 @@ python backend/manage.py loaddata questions/question_bank.json
 ```
 
 Questions can then be managed in the Django Admin under **Questions**.
+
+## Games and rounds
+
+The `games` app stores the game domain: `Game`, `GamePlayer` (up to 3 per game),
+`Round` (one choice or numeric question each) and `RoundAnswer` (one per player per round).
+Database constraints guard the core rules, and everything can be inspected in the Django Admin under **Games**.
