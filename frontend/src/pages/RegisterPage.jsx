@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useAuth } from '../auth/useAuth.js'
 import { FormErrors, TextField } from '../components/Form.jsx'
+import { Logo } from '../components/Logo.jsx'
 
 const FIELDS = ['username', 'email', 'nickname', 'password', 'password_confirm']
 const EMPTY_FORM = { username: '', email: '', nickname: '', password: '', password_confirm: '' }
@@ -31,8 +32,9 @@ export default function RegisterPage() {
   )
 
   return (
-    <section className="card">
-      <h1>Регистрация</h1>
+    <section className="panel">
+      <Logo />
+      <h1 className="plaque">Регистрация</h1>
       <form onSubmit={onSubmit} noValidate>
         <FormErrors errors={errors} fields={FIELDS} />
         {field('username', 'Потребителско име', { autoComplete: 'username' })}
@@ -40,13 +42,14 @@ export default function RegisterPage() {
         {field('nickname', 'Nickname в играта', { maxLength: 30 })}
         {field('password', 'Парола', { type: 'password', autoComplete: 'new-password' })}
         {field('password_confirm', 'Повтори паролата', { type: 'password', autoComplete: 'new-password' })}
-        <button type="submit" disabled={submitting}>
-          {submitting ? 'Регистриране…' : 'Регистрация'}
+        <button type="submit" className="btn btn--red" disabled={submitting}>
+          {submitting ? 'Регистриране…' : 'Регистрирай се'}
         </button>
       </form>
-      <p className="card__footer">
-        Вече имаш акаунт? <a href="#/login">Вход</a>
-      </p>
+      <p className="panel__hint">Вече имаш акаунт?</p>
+      <a className="btn btn--wood" href="#/login">
+        Вход
+      </a>
     </section>
   )
 }

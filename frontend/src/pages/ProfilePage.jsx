@@ -35,11 +35,12 @@ export default function ProfilePage() {
   }
 
   return (
-    <section className="card card--wide">
+    <section className="panel panel--wide">
+      <h1 className="plaque">Профил</h1>
       <header className="profile-header">
         <Avatar avatarKey={user.profile.avatar_key} size={80} />
         <div>
-          <h1>{user.profile.nickname}</h1>
+          <h2 className="profile-header__nick">{user.profile.nickname}</h2>
           <p className="muted">
             @{user.username} · {user.email}
           </p>
@@ -64,7 +65,7 @@ export default function ProfilePage() {
           <FieldErrors messages={errors.avatar_key} />
         </fieldset>
 
-        <button type="submit" disabled={saving || !isDirty}>
+        <button type="submit" className="btn btn--red" disabled={saving || !isDirty}>
           {saving ? 'Запазване…' : 'Запази промените'}
         </button>
         {saved && <p className="success" role="status">Профилът е обновен.</p>}

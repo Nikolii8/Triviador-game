@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { useAuth } from './auth/useAuth.js'
 import { Avatar } from './components/Avatar.jsx'
+import { Logo } from './components/Logo.jsx'
 import LoginPage from './pages/LoginPage.jsx'
 import ProfilePage from './pages/ProfilePage.jsx'
 import RegisterPage from './pages/RegisterPage.jsx'
@@ -25,20 +26,20 @@ export default function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <a className="brand" href="#/">
-          Triviador
+        <a className="brand" href="#/" aria-label="Triviador">
+          <Logo small />
         </a>
         {user && (
           <nav className="topbar__user">
             <Avatar avatarKey={user.profile.avatar_key} size={32} />
             <span className="topbar__nick">{user.profile.nickname}</span>
-            <button type="button" className="button--ghost" onClick={logout}>
+            <button type="button" className="btn btn--yellow" onClick={logout}>
               Изход
             </button>
           </nav>
         )}
       </header>
-      <main className="content">{Page ? <Page key={route} /> : <p className="muted">Зареждане…</p>}</main>
+      <main className="content">{Page ? <Page key={route} /> : <p className="loading">Зареждане…</p>}</main>
     </div>
   )
 }

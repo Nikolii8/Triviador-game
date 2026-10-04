@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useAuth } from '../auth/useAuth.js'
 import { FormErrors, TextField } from '../components/Form.jsx'
+import { Logo } from '../components/Logo.jsx'
 
 const FIELDS = ['username', 'password']
 
@@ -27,19 +28,21 @@ export default function LoginPage() {
   }
 
   return (
-    <section className="card">
-      <h1>Вход</h1>
+    <section className="panel">
+      <Logo />
+      <h1 className="plaque">Вход</h1>
       <form onSubmit={onSubmit} noValidate>
         <FormErrors errors={errors} fields={FIELDS} />
         <TextField label="Потребителско име" name="username" value={form.username} onChange={onChange} errors={errors} autoComplete="username" required />
         <TextField label="Парола" name="password" type="password" value={form.password} onChange={onChange} errors={errors} autoComplete="current-password" required />
-        <button type="submit" disabled={submitting}>
-          {submitting ? 'Влизане…' : 'Вход'}
+        <button type="submit" className="btn btn--red" disabled={submitting}>
+          {submitting ? 'Влизане…' : 'Влез в играта'}
         </button>
       </form>
-      <p className="card__footer">
-        Нямаш акаунт? <a href="#/register">Регистрирай се</a>
-      </p>
+      <p className="panel__hint">Нямаш акаунт?</p>
+      <a className="btn btn--wood" href="#/register">
+        Създай акаунт
+      </a>
     </section>
   )
 }
