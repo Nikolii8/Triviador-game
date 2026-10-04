@@ -13,6 +13,10 @@ class ProfileInline(admin.StackedInline):
 @admin.register(User)
 class CustomUserAdmin(UserAdmin):
     inlines = [ProfileInline]
+    add_fieldsets = (
+        (None, {'classes': ('wide',), 'fields': ('username', 'email', 'password1', 'password2')}),
+    )
+    list_display = ('username', 'email', 'is_staff')
 
 
 @admin.register(Profile)

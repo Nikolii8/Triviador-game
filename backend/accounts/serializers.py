@@ -1,5 +1,6 @@
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from rest_framework import serializers
 
@@ -24,25 +25,27 @@ class UserSerializer(serializers.ModelSerializer):
 
 class RegisterSerializer(serializers.ModelSerializer):
     nickname = serializers.CharField(max_length=30)
-    password = serializers.CharField(write_only=True, validators=[validate_password])
-    password_confirm = serializers.CharField(write_only=True)
+    password = serializers.CharField(write_only=True, style={'input_type': 'password'})
+    password_confirm = serializers.CharField(write_only=True, style={'input_type': 'password'})
 
     class Meta:
         model = User
         fields = ['username', 'email', 'nickname', 'password', 'password_confirm']
 
+    def validate_nickname(self, value):
+        if Profile.objects.filter(nickname=value).exists():
+            raise serializers.ValidationError('This nickname is already taken.')
+        return value
+
     def validate(self, attrs):
         if attrs['password'] != attrs['password_confirm']:
             raise serializers.ValidationError({'password_confirm': ['Passwords do not match.']})
 
-        if User.objects.filter(username=attrs['username']).exists():
-            raise serializers.ValidationError({'username': ['A user with that username already exists.']})
-
-        if User.objects.filter(email=attrs['email']).exists():
-            raise serializers.ValidationError({'email': ['User with this email already exists.']})
-
-        if Profile.objects.filter(nickname=attrs['nickname']).exists():
-            raise serializers.ValidationError({'nickname': ['This nickname is already taken.']})
+        candidate = User(username=attrs['username'], email=attrs['email'])
+        try:
+            validate_password(attrs['password'], user=candidate)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({'password': list(exc.messages)})
 
         return attrs
 
@@ -52,13 +55,15 @@ class RegisterSerializer(serializers.ModelSerializer):
         nickname = validated_data.pop('nickname')
 
         with transaction.atomic():
-            user = User.objects.create_user(
-                password=password,
-                **validated_data,
-            )
+            user = User.objects.create_user(password=password, **validated_data)
             user.profile.nickname = nickname
             user.profile.save(update_fields=['nickname'])
-            return user
+        return user
 
     def to_representation(self, instance):
         return UserSerializer(instance).data
+
+
+class LoginSerializer(serializers.Serializer):
+    username = serializers.CharField()
+    password = serializers.CharField(write_only=True, style={'input_type': 'password'})

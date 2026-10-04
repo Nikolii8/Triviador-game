@@ -3,12 +3,10 @@ attrs==26.1.0
 Django==6.1.1
 django-cors-headers==4.9.0
 djangorestframework==3.18.1
-djangorestframework_simplejwt==5.5.1
 drf-spectacular==0.30.0
 inflection==0.5.1
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
-PyJWT==2.14.0
 python-decouple==3.8
 PyYAML==6.0.3
 referencing==0.37.0

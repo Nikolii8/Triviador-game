@@ -2,53 +2,69 @@ from django.contrib.auth import authenticate, login, logout
 from django.views.decorators.csrf import ensure_csrf_cookie
 from rest_framework import permissions, status
 from rest_framework.authentication import SessionAuthentication
-from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.exceptions import ValidationError
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .serializers import ProfileSerializer, RegisterSerializer, UserSerializer
+from .serializers import LoginSerializer, ProfileSerializer, RegisterSerializer, UserSerializer
+
+PROFILE_UPDATE_FIELDS = {'nickname', 'avatar_key'}
 
 
-@api_view(['GET'])
-@permission_classes([permissions.AllowAny])
-@authentication_classes([])
-@ensure_csrf_cookie
-def csrf_view(request: Request) -> Response:
-    return Response(status=status.HTTP_204_NO_CONTENT)
+class CsrfEnforcedPublicView(APIView):
+    """Public endpoint that still requires a valid CSRF token for unsafe methods.
 
+    DRF's SessionAuthentication only checks CSRF for already-authenticated users,
+    so anonymous register/login requests would otherwise skip the check.
+    """
 
-class RegisterView(APIView):
     permission_classes = [permissions.AllowAny]
+    authentication_classes = [SessionAuthentication]
 
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+        SessionAuthentication().enforce_csrf(request)
+
+
+class CsrfView(APIView):
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+
+    def get(self, request: Request) -> Response:
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+csrf_view = ensure_csrf_cookie(CsrfView.as_view())
+
+
+class RegisterView(CsrfEnforcedPublicView):
     def post(self, request: Request) -> Response:
         serializer = RegisterSerializer(data=request.data)
-        if serializer.is_valid():
-            user = serializer.save()
-            return Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        return Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
 
 
-@api_view(['POST'])
-@permission_classes([permissions.AllowAny])
-@authentication_classes([])
-def login_view(request: Request) -> Response:
-    username = request.data.get('username')
-    password = request.data.get('password')
-    user = authenticate(request, username=username, password=password)
-    if user is None:
-        return Response({'detail': 'Invalid credentials.'}, status=status.HTTP_400_BAD_REQUEST)
+class LoginView(CsrfEnforcedPublicView):
+    def post(self, request: Request) -> Response:
+        serializer = LoginSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = authenticate(request, **serializer.validated_data)
+        if user is None:
+            raise ValidationError({'non_field_errors': ['Invalid username or password.']})
 
-    login(request, user)
-    return Response(UserSerializer(user).data, status=status.HTTP_200_OK)
+        login(request, user)
+        return Response(UserSerializer(user).data, status=status.HTTP_200_OK)
 
 
-@api_view(['POST'])
-@permission_classes([permissions.IsAuthenticated])
-@authentication_classes([SessionAuthentication])
-def logout_view(request: Request) -> Response:
-    logout(request)
-    return Response(status=status.HTTP_204_NO_CONTENT)
+class LogoutView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [SessionAuthentication]
+
+    def post(self, request: Request) -> Response:
+        logout(request)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class MeView(APIView):
@@ -59,13 +75,12 @@ class MeView(APIView):
         return Response(UserSerializer(request.user).data)
 
     def patch(self, request: Request) -> Response:
-        data = {key: value for key, value in request.data.items() if key in {'nickname', 'avatar_key'}}
+        # Only profile fields are editable; anything else (is_staff, username, ...) is ignored.
+        data = {key: value for key, value in request.data.items() if key in PROFILE_UPDATE_FIELDS}
         if not data:
-            return Response({'detail': 'No valid profile fields provided.'}, status=status.HTTP_400_BAD_REQUEST)
+            raise ValidationError({'non_field_errors': ['Provide nickname and/or avatar_key.']})
 
-        profile = request.user.profile
-        serializer = ProfileSerializer(profile, data=data, partial=True)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(UserSerializer(request.user).data, status=status.HTTP_200_OK)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        serializer = ProfileSerializer(request.user.profile, data=data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(UserSerializer(request.user).data, status=status.HTTP_200_OK)
