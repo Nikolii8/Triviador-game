@@ -36,7 +36,7 @@ export default function ProfilePage() {
 
   return (
     <section className="panel panel--wide">
-      <h1 className="plaque">Профил</h1>
+      <h1 className="plaque">Profile</h1>
       <header className="profile-header">
         <Avatar avatarKey={user.profile.avatar_key} size={80} />
         <div>
@@ -52,7 +52,7 @@ export default function ProfilePage() {
         <TextField label="Nickname" name="nickname" value={form.nickname} onChange={(e) => update('nickname', e.target.value)} errors={errors} maxLength={30} required />
 
         <fieldset className="avatar-picker">
-          <legend className="field__label">Аватар</legend>
+          <legend className="field__label">Avatar</legend>
           <div className="avatar-picker__options">
             {AVATAR_KEYS.map((key) => (
               <label key={key} className={`avatar-option${form.avatar_key === key ? ' avatar-option--selected' : ''}`}>
@@ -66,9 +66,9 @@ export default function ProfilePage() {
         </fieldset>
 
         <button type="submit" className="btn btn--red" disabled={saving || !isDirty}>
-          {saving ? 'Запазване…' : 'Запази промените'}
+          {saving ? 'Saving…' : 'Save changes'}
         </button>
-        {saved && <p className="success" role="status">Профилът е обновен.</p>}
+        {saved && <p className="success" role="status">Profile updated.</p>}
       </form>
     </section>
   )

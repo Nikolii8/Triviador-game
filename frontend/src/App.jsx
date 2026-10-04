@@ -34,12 +34,12 @@ export default function App() {
             <Avatar avatarKey={user.profile.avatar_key} size={32} />
             <span className="topbar__nick">{user.profile.nickname}</span>
             <button type="button" className="btn btn--yellow" onClick={logout}>
-              Изход
+              Log out
             </button>
           </nav>
         )}
       </header>
-      <main className="content">{Page ? <Page key={route} /> : <p className="loading">Зареждане…</p>}</main>
+      <main className="content">{Page ? <Page key={route} /> : <p className="loading">Loading…</p>}</main>
     </div>
   )
 }

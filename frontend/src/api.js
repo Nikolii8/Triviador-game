@@ -32,14 +32,14 @@ async function request(method, path, body) {
       body: body === undefined ? undefined : JSON.stringify(body),
     })
   } catch {
-    throw new ApiError(0, { non_field_errors: ['Няма връзка със сървъра.'] })
+    throw new ApiError(0, { non_field_errors: ['Cannot reach the server.'] })
   }
 
   if (response.status === 204) return null
 
   const data = await response.json().catch(() => ({}))
   if (!response.ok) {
-    throw new ApiError(response.status, data.errors || { non_field_errors: [`Грешка ${response.status}`] })
+    throw new ApiError(response.status, data.errors || { non_field_errors: [`Request failed (${response.status})`] })
   }
   return data
 }

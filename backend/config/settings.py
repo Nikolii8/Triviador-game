@@ -85,7 +85,7 @@ REST_FRAMEWORK = {
 
 SPECTACULAR_SETTINGS = {
     'TITLE': 'Triviador API',
-    'DESCRIPTION': 'API за multiplayer quiz-territory игра',
+    'DESCRIPTION': 'API for a multiplayer quiz-territory game',
     'VERSION': '1.0.0',
 }
 

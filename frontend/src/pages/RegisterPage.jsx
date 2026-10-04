@@ -34,21 +34,21 @@ export default function RegisterPage() {
   return (
     <section className="panel">
       <Logo />
-      <h1 className="plaque">Регистрация</h1>
+      <h1 className="plaque">Sign up</h1>
       <form onSubmit={onSubmit} noValidate>
         <FormErrors errors={errors} fields={FIELDS} />
-        {field('username', 'Потребителско име', { autoComplete: 'username' })}
-        {field('email', 'Имейл', { type: 'email', autoComplete: 'email' })}
-        {field('nickname', 'Nickname в играта', { maxLength: 30 })}
-        {field('password', 'Парола', { type: 'password', autoComplete: 'new-password' })}
-        {field('password_confirm', 'Повтори паролата', { type: 'password', autoComplete: 'new-password' })}
+        {field('username', 'Username', { autoComplete: 'username' })}
+        {field('email', 'Email', { type: 'email', autoComplete: 'email' })}
+        {field('nickname', 'In-game nickname', { maxLength: 30 })}
+        {field('password', 'Password', { type: 'password', autoComplete: 'new-password' })}
+        {field('password_confirm', 'Confirm password', { type: 'password', autoComplete: 'new-password' })}
         <button type="submit" className="btn btn--red" disabled={submitting}>
-          {submitting ? 'Регистриране…' : 'Регистрирай се'}
+          {submitting ? 'Creating account…' : 'Sign up'}
         </button>
       </form>
-      <p className="panel__hint">Вече имаш акаунт?</p>
+      <p className="panel__hint">Already have an account?</p>
       <a className="btn btn--wood" href="#/login">
-        Вход
+        Log in
       </a>
     </section>
   )

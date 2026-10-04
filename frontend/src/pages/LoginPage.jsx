@@ -30,18 +30,18 @@ export default function LoginPage() {
   return (
     <section className="panel">
       <Logo />
-      <h1 className="plaque">Вход</h1>
+      <h1 className="plaque">Log in</h1>
       <form onSubmit={onSubmit} noValidate>
         <FormErrors errors={errors} fields={FIELDS} />
-        <TextField label="Потребителско име" name="username" value={form.username} onChange={onChange} errors={errors} autoComplete="username" required />
-        <TextField label="Парола" name="password" type="password" value={form.password} onChange={onChange} errors={errors} autoComplete="current-password" required />
+        <TextField label="Username" name="username" value={form.username} onChange={onChange} errors={errors} autoComplete="username" required />
+        <TextField label="Password" name="password" type="password" value={form.password} onChange={onChange} errors={errors} autoComplete="current-password" required />
         <button type="submit" className="btn btn--red" disabled={submitting}>
-          {submitting ? 'Влизане…' : 'Влез в играта'}
+          {submitting ? 'Logging in…' : 'Start game'}
         </button>
       </form>
-      <p className="panel__hint">Нямаш акаунт?</p>
+      <p className="panel__hint">Don't have an account?</p>
       <a className="btn btn--wood" href="#/register">
-        Създай акаунт
+        Create account
       </a>
     </section>
   )
