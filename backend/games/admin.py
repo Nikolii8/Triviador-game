@@ -1,5 +1,7 @@
 from django.contrib import admin
 
+from territories.models import Capital, Territory
+
 from .models import Game, GamePlayer, Round, RoundAnswer
 
 
@@ -34,6 +36,13 @@ class GameAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at',)
     list_select_related = ('created_by',)
     inlines = [GamePlayerInline, RoundInline]
+
+    def get_deleted_objects(self, objs, request):
+        # A game's territories and capitals belong to it and go with it, even though
+        # the admin does not allow deleting them one by one.
+        deleted, model_count, perms_needed, protected = super().get_deleted_objects(objs, request)
+        perms_needed -= {Territory._meta.verbose_name, Capital._meta.verbose_name}
+        return deleted, model_count, perms_needed, protected
 
 
 @admin.register(GamePlayer)

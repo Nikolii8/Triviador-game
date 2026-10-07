@@ -46,6 +46,7 @@ INSTALLED_APPS = [
     'accounts',
     'questions',
     'games',
+    'territories',
 ]
 
 AUTH_USER_MODEL = 'accounts.User'
