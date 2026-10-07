@@ -118,7 +118,9 @@ class Round(models.Model):
     game = models.ForeignKey(Game, on_delete=models.CASCADE, related_name='rounds')
     number = models.PositiveIntegerField()
     status = models.CharField(max_length=20, choices=ROUND_STATUS_CHOICES, default=PENDING)
-    question_type = models.CharField(max_length=20, choices=QUESTION_TYPE_CHOICES)
+    # Kept in sync automatically in save(): it is derived from whichever question is set,
+    # never entered by hand, so it cannot disagree with the question.
+    question_type = models.CharField(max_length=20, choices=QUESTION_TYPE_CHOICES, editable=False)
     choice_question = models.ForeignKey(
         ChoiceQuestion,
         null=True,
@@ -145,7 +147,8 @@ class Round(models.Model):
                 condition=Q(status__in=['pending', 'open', 'closed', 'evaluated']),
                 name='round_status_valid',
             ),
-            # Exactly one question, and it must match question_type.
+            # Safety net for writes that bypass save() (e.g. queryset.update()):
+            # exactly one question, and it must match question_type.
             models.CheckConstraint(
                 condition=(
                     Q(question_type='choice', choice_question__isnull=False, numeric_question__isnull=True)
@@ -161,20 +164,33 @@ class Round(models.Model):
 
     @property
     def question(self):
-        return self.choice_question if self.question_type == self.CHOICE else self.numeric_question
+        return self.choice_question if self.choice_question_id is not None else self.numeric_question
+
+    def _sync_question_type(self):
+        """Set question_type from the question; return False if there is not exactly one question."""
+        has_choice = self.choice_question_id is not None
+        has_numeric = self.numeric_question_id is not None
+        if has_choice == has_numeric:
+            return False
+        self.question_type = self.CHOICE if has_choice else self.NUMERIC
+        return True
+
+    def clean_fields(self, exclude=None):
+        # question_type is derived, not user input: sync it first and validate it via clean().
+        self._sync_question_type()
+        super().clean_fields(exclude={*(exclude or ()), 'question_type'})
 
     def clean(self):
         super().clean()
-        if self.question_type == self.CHOICE:
-            if self.choice_question_id is None:
-                raise ValidationError({'choice_question': 'A choice round needs a choice question.'})
-            if self.numeric_question_id is not None:
-                raise ValidationError({'numeric_question': 'A choice round cannot have a numeric question.'})
-        elif self.question_type == self.NUMERIC:
-            if self.numeric_question_id is None:
-                raise ValidationError({'numeric_question': 'A numeric round needs a numeric question.'})
-            if self.choice_question_id is not None:
-                raise ValidationError({'choice_question': 'A numeric round cannot have a choice question.'})
+        if not self._sync_question_type():
+            raise ValidationError('A round must have exactly one question: either a choice or a numeric one.')
+
+    def save(self, *args, **kwargs):
+        if self._sync_question_type():
+            update_fields = kwargs.get('update_fields')
+            if update_fields is not None and {'choice_question', 'numeric_question'} & set(update_fields):
+                kwargs['update_fields'] = {*update_fields, 'question_type'}
+        super().save(*args, **kwargs)
 
 
 class RoundAnswer(models.Model):

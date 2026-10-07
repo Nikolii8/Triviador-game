@@ -73,26 +73,32 @@ class RoundConstraintTests(ConstraintTestCase):
     def test_invalid_status_is_rejected(self):
         self.assert_integrity_error(lambda: make_choice_round(self.game, status='paused'))
 
-    def test_question_must_match_type(self):
-        choice_question = make_choice_question()
-        numeric_question = make_numeric_question()
+    def test_round_has_exactly_one_question(self):
         cases = {
-            'choice without question': {'question_type': Round.CHOICE},
-            'numeric without question': {'question_type': Round.NUMERIC},
-            'choice round with numeric question': {
-                'question_type': Round.CHOICE,
-                'numeric_question': numeric_question,
-            },
+            'no question': {'question_type': Round.CHOICE},
             'both questions': {
-                'question_type': Round.CHOICE,
-                'choice_question': choice_question,
-                'numeric_question': numeric_question,
+                'choice_question': make_choice_question(),
+                'numeric_question': make_numeric_question(),
             },
-            'unknown type': {'question_type': 'essay', 'choice_question': choice_question},
         }
         for label, fields in cases.items():
             with self.subTest(label):
                 self.assert_integrity_error(lambda: Round.objects.create(game=self.game, number=1, **fields))
+
+    def test_question_type_cannot_drift_when_save_is_bypassed(self):
+        round_ = make_choice_round(self.game)
+        rounds = Round.objects.filter(pk=round_.pk)
+        numeric_question = make_numeric_question()
+        cases = {
+            'type changed alone': {'question_type': Round.NUMERIC},
+            'question changed alone': {'choice_question': None, 'numeric_question': numeric_question},
+            'unknown type': {'question_type': 'essay'},
+        }
+        for label, changes in cases.items():
+            with self.subTest(label):
+                self.assert_integrity_error(lambda: rounds.update(**changes))
+        round_.refresh_from_db()
+        self.assertEqual(round_.question_type, Round.CHOICE)
 
     def test_finished_at_cannot_be_before_started_at(self):
         now = timezone.now()

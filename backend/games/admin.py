@@ -13,7 +13,8 @@ class GamePlayerInline(admin.TabularInline):
 class RoundInline(admin.TabularInline):
     model = Round
     extra = 0
-    fields = ('number', 'status', 'question_type', 'choice_question', 'numeric_question', 'started_at', 'finished_at')
+    fields = ('number', 'status', 'choice_question', 'numeric_question', 'question_type', 'started_at', 'finished_at')
+    readonly_fields = ('question_type',)
     autocomplete_fields = ('choice_question', 'numeric_question')
     show_change_link = True
 
@@ -49,6 +50,7 @@ class GamePlayerAdmin(admin.ModelAdmin):
 class RoundAdmin(admin.ModelAdmin):
     list_display = ('__str__', 'game', 'number', 'status', 'question_type')
     list_filter = ('status', 'question_type')
+    readonly_fields = ('question_type',)
     raw_id_fields = ('game',)
     autocomplete_fields = ('choice_question', 'numeric_question')
     list_select_related = ('game',)

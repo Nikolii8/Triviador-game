@@ -12,6 +12,7 @@ from .factories import (
     make_choice_question,
     make_choice_round,
     make_game,
+    make_numeric_question,
     make_numeric_round,
     make_user,
 )
@@ -143,6 +144,7 @@ class RoundTests(TestCase):
 
         round_.full_clean()
         self.assertEqual(round_.status, Round.PENDING)
+        self.assertEqual(round_.question_type, Round.CHOICE)
         self.assertEqual(round_.question, round_.choice_question)
         self.assertIn(round_, self.game.rounds.all())
         self.assertIn(round_, round_.choice_question.rounds.all())
@@ -151,6 +153,7 @@ class RoundTests(TestCase):
         round_ = make_numeric_round(self.game)
 
         round_.full_clean()
+        self.assertEqual(round_.question_type, Round.NUMERIC)
         self.assertEqual(round_.question, round_.numeric_question)
         self.assertIn(round_, round_.numeric_question.rounds.all())
 
@@ -174,21 +177,37 @@ class RoundTests(TestCase):
 
         self.assertEqual(list(self.game.rounds.all()), [first, second, third])
 
-    def test_question_must_match_question_type(self):
-        choice_question = make_choice_question()
-        numeric_round = make_numeric_round(make_game(make_user('other')))
+    def test_question_type_is_derived_from_the_question(self):
+        # A wrong type passed by hand is corrected on save.
+        round_ = Round.objects.create(
+            game=self.game, number=1, question_type=Round.NUMERIC, choice_question=make_choice_question()
+        )
+        round_.refresh_from_db()
+        self.assertEqual(round_.question_type, Round.CHOICE)
+
+        round_.choice_question = None
+        round_.numeric_question = make_numeric_question()
+        round_.save(update_fields=['choice_question', 'numeric_question'])
+
+        round_.refresh_from_db()
+        self.assertEqual(round_.question_type, Round.NUMERIC)
+        self.assertEqual(round_.question, round_.numeric_question)
+
+    def test_full_clean_sets_question_type_on_new_round(self):
+        round_ = Round(game=self.game, number=1, numeric_question=make_numeric_question())
+
+        round_.full_clean()
+
+        self.assertEqual(round_.question_type, Round.NUMERIC)
+
+    def test_round_needs_exactly_one_question(self):
         cases = {
-            'choice without question': Round(game=self.game, number=1, question_type=Round.CHOICE),
-            'numeric without question': Round(game=self.game, number=1, question_type=Round.NUMERIC),
-            'numeric with choice question': Round(
-                game=self.game, number=1, question_type=Round.NUMERIC, choice_question=choice_question
-            ),
+            'no question': Round(game=self.game, number=1),
             'both questions': Round(
                 game=self.game,
                 number=1,
-                question_type=Round.CHOICE,
-                choice_question=choice_question,
-                numeric_question=numeric_round.numeric_question,
+                choice_question=make_choice_question(),
+                numeric_question=make_numeric_question(),
             ),
         }
         for label, round_ in cases.items():

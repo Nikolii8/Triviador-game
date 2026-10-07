@@ -36,7 +36,6 @@ def make_choice_round(game, number=1, question=None, **fields):
     return Round.objects.create(
         game=game,
         number=number,
-        question_type=Round.CHOICE,
         choice_question=question or make_choice_question(),
         **fields,
     )
@@ -46,7 +45,6 @@ def make_numeric_round(game, number=1, question=None, **fields):
     return Round.objects.create(
         game=game,
         number=number,
-        question_type=Round.NUMERIC,
         numeric_question=question or make_numeric_question(),
         **fields,
     )
