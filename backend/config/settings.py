@@ -119,6 +119,18 @@ DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'db.sqlite3',
+        'OPTIONS': {
+            # SQLite ignores select_for_update(). IMMEDIATE makes every transaction take the
+            # database write lock up front, so concurrent game initializations run one after
+            # another instead of interleaving. `timeout` is how long a writer waits for the lock.
+            'transaction_mode': 'IMMEDIATE',
+            'timeout': 20,
+        },
+        'TEST': {
+            # A file (not the default in-memory DB) so the concurrency tests can use real
+            # separate connections from several threads.
+            'NAME': BASE_DIR / 'test_db.sqlite3',
+        },
     }
 }
 

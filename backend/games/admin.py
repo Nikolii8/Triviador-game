@@ -1,7 +1,8 @@
-from django.contrib import admin
+from django.contrib import admin, messages
 
 from territories.models import Capital, Territory
 
+from .initialization import GameInitializationError, initialize_game
 from .models import Game, GamePlayer, Round, RoundAnswer
 
 
@@ -10,6 +11,13 @@ class GamePlayerInline(admin.TabularInline):
     extra = 0
     autocomplete_fields = ('user',)
     readonly_fields = ('joined_at',)
+
+    # Once a game has started its line-up is frozen.
+    def has_add_permission(self, request, obj=None):
+        return (obj is None or obj.status == Game.WAITING) and super().has_add_permission(request, obj)
+
+    def has_delete_permission(self, request, obj=None):
+        return (obj is None or obj.status == Game.WAITING) and super().has_delete_permission(request, obj)
 
 
 class RoundInline(admin.TabularInline):
@@ -36,6 +44,17 @@ class GameAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at',)
     list_select_related = ('created_by',)
     inlines = [GamePlayerInline, RoundInline]
+    actions = ['initialize_selected_games']
+
+    @admin.action(description='Initialize selected games (build map, assign capitals, start)')
+    def initialize_selected_games(self, request, queryset):
+        for game_id in queryset.values_list('pk', flat=True):
+            try:
+                initialize_game(game_id)
+            except GameInitializationError as exc:
+                self.message_user(request, f'Game #{game_id}: {" ".join(exc.messages)}', messages.ERROR)
+            else:
+                self.message_user(request, f'Game #{game_id} initialized and started.', messages.SUCCESS)
 
     def get_deleted_objects(self, objs, request):
         # A game's territories and capitals belong to it and go with it, even though

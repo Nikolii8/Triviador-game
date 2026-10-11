@@ -116,6 +116,51 @@ no self-links or duplicate borders, at least 2 neighbors each, fully connected, 
 three pairwise non-adjacent territories for the starting capitals. `validate_game_map(game)` checks,
 read-only, that a game's saved territories and borders match the definition exactly.
 
-**Game initialization is part of M05.** In M04, creating a game does not create its territories,
-pick capitals or change its status. In the Django Admin, territories and capitals can be inspected and
+Creating a game does not create its territories, pick capitals or change its status; that is the
+separate initialization step below. In the Django Admin, territories and capitals can be inspected and
 their `score` / `health` adjusted, but not added, deleted or re-linked.
+
+## Game initialization
+
+Initialization (`games/initialization.py`, `initialize_game(game_id)`) turns a waiting game into a
+running one in **one database transaction**:
+
+1. checks the game is `waiting`, has exactly 3 players and has no map records yet;
+2. checks the project map definition is valid;
+3. creates the game's own 18 territories and all their borders from `PROJECT_MAP`;
+4. picks a random set of three pairwise non-adjacent territories and randomly gives one to each player
+   as their capital (owner set, health 3); the other 15 territories stay neutral, every score stays 0;
+5. sets the game status to `in_progress` and `started_at`.
+
+The milestone calls the running state `active`; this project stores it as `in_progress`, the status
+defined in M03. Player scores and rounds are not touched.
+
+If any check fails, or anything goes wrong midway, nothing is changed: the error says why and the whole
+transaction is rolled back. A second attempt, or a game that already has some map records, is refused
+rather than repaired. Once a game has started, players can no longer join or leave it.
+
+### How to run it
+
+1. Create three users (sign up in the app or use `createsuperuser`).
+2. In the Django Admin, add a **Game** and give it three **players** (orders 1, 2, 3).
+3. Start it in one of two ways:
+   - Admin: tick the game in the Games list, choose **Initialize selected games**, click **Go**.
+   - Command line: `python backend/manage.py initialize_game <game id>`
+4. The game's territories and capitals then appear under **Territories**.
+
+### Concurrent attempts and the database
+
+Two simultaneous attempts on the same game must not produce two maps. The code protects this in layers:
+
+- `select_for_update()` locks the game row, so on **PostgreSQL** the second attempt waits for the first
+  and then sees the game is no longer waiting. Joining or leaving a game locks the same row.
+- Unique constraints (`(game, slug)` per territory, one capital per player and per territory, player
+  order 1-3 per game) make a second map or a fourth player impossible at the database level anyway.
+
+**SQLite (used for development) does not support row locks**: `select_for_update()` is silently ignored.
+Instead, `transaction_mode: IMMEDIATE` in `settings.py` makes every transaction take the database-wide
+write lock when it begins, so attempts run strictly one after another. This is coarser than PostgreSQL
+(all writes are serialized, not just those for one game) and a writer gives up with
+`database is locked` after the 20 s `timeout`. The concurrency tests (`games/tests/test_concurrency.py`)
+run real threads against a file-based SQLite test database; they would need re-running on PostgreSQL to
+confirm the row-lock behaviour there.

@@ -1,6 +1,6 @@
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import models
+from django.db import models, transaction
 from django.db.models import F, Q
 
 from questions.models import AnswerOption, ChoiceQuestion, NumericQuestion
@@ -92,6 +92,27 @@ class GamePlayer(models.Model):
         others = GamePlayer.objects.filter(game_id=self.game_id).exclude(pk=self.pk)
         if others.count() >= MAX_PLAYERS:
             raise ValidationError(f'A game can have at most {MAX_PLAYERS} players.')
+        if self._state.adding:
+            self._ensure_game_is_waiting('join')
+
+    def _ensure_game_is_waiting(self, action):
+        # Read (and lock) the game row from the database, not a possibly stale self.game, so a
+        # join/leave cannot interleave with game initialization, which locks the same row.
+        if not Game.objects.select_for_update().filter(pk=self.game_id, status=Game.WAITING).exists():
+            raise ValidationError(f'Players can only {action} a game that is still waiting to start.')
+
+    def save(self, *args, **kwargs):
+        # The line-up is frozen once the game starts (M05): no new players after that.
+        with transaction.atomic():
+            if self._state.adding:
+                self._ensure_game_is_waiting('join')
+            super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        # Deleting the whole game still cascades; only removing a single player is blocked.
+        with transaction.atomic():
+            self._ensure_game_is_waiting('leave')
+            return super().delete(*args, **kwargs)
 
 
 class Round(models.Model):
