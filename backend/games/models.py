@@ -7,6 +7,12 @@ from questions.models import AnswerOption, ChoiceQuestion, NumericQuestion
 
 MAX_PLAYERS = 3
 
+PLAYER_COLORS = [
+    ('red', 'Red'),
+    ('blue', 'Blue'),
+    ('yellow', 'Yellow'),
+]
+
 
 def _finished_after_started(prefix):
     return models.CheckConstraint(
@@ -67,6 +73,7 @@ class GamePlayer(models.Model):
         related_name='game_players',
     )
     player_order = models.PositiveSmallIntegerField()
+    color = models.CharField(max_length=10, choices=PLAYER_COLORS, default='red')
     score = models.IntegerField(default=0)
     is_active = models.BooleanField(default=True)
     joined_at = models.DateTimeField(auto_now_add=True)
@@ -76,6 +83,7 @@ class GamePlayer(models.Model):
         constraints = [
             models.UniqueConstraint(fields=['game', 'user'], name='gameplayer_unique_user_per_game'),
             models.UniqueConstraint(fields=['game', 'player_order'], name='gameplayer_unique_order_per_game'),
+            models.UniqueConstraint(fields=['game', 'color'], name='gameplayer_unique_color_per_game'),
             models.CheckConstraint(
                 condition=Q(player_order__gte=1, player_order__lte=MAX_PLAYERS),
                 name='gameplayer_order_in_range',
@@ -113,6 +121,23 @@ class GamePlayer(models.Model):
         with transaction.atomic():
             self._ensure_game_is_waiting('leave')
             return super().delete(*args, **kwargs)
+
+# This is the new class
+class WaitingRoom(models.Model):
+    # Here I define the model which is used to store the users who are waiting to join a game. Each user can only be in the waiting room once, and the waiting room is ordered by the time the user joined.
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='waiting_room',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+# Here I define the meta class which is used to order the waiting room by the time the user joined and by the primary key of the user.
+    class Meta:
+        ordering = ['created_at', 'pk']
+# Here I define the string representation of the waiting room which is used to show the user who is waiting to join the game.
+    def __str__(self) -> str:
+        return f'{self.user} is waiting to join a game'
 
 
 class Round(models.Model):
