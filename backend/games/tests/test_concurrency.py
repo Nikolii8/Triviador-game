@@ -14,6 +14,7 @@ from django.test import TransactionTestCase
 from django.utils import timezone
 
 from games.initialization import GameInitializationError, initialize_game
+from games.battles import attackable_territories, create_battle
 from games.capture import allowed_territories, choose_territory
 from games.models import CaptureRight, Game, GamePlayer, RoundAnswer, ScoreEntry
 from games import rounds
@@ -23,6 +24,7 @@ from territories.map_definition import PROJECT_MAP
 from territories.models import Capital, Territory
 
 from .factories import add_player, make_game, make_user
+from .test_battles import make_choice_bank
 
 
 def run_simultaneously(*targets):
@@ -192,3 +194,38 @@ class ConcurrentCaptureTests(TransactionTestCase):
         self.assertEqual(sum(isinstance(r, ScoreEntry) for r in results), 1, results)
         self.assertEqual(CaptureRight.objects.get(player=second).used, 1)
         self.assertEqual(Territory.objects.filter(owner=second).count(), 2)  # capital + exactly one pick
+
+
+class ConcurrentBattleTieTests(TransactionTestCase):
+    """M08 upgrade: two simultaneous attempts to create the numeric step after two correct answers."""
+
+    def test_only_one_next_step_is_created(self):
+        game = make_game(make_user('host'))
+        players = [add_player(game, f'p{order}', order) for order in (1, 2, 3)]
+        initialize_game(game.pk)
+        for index, territory in enumerate(Territory.objects.filter(game=game, owner__isnull=True).order_by('pk')):
+            Territory.objects.filter(pk=territory.pk).update(owner=players[index % 3])
+        make_choice_bank(1)
+        category = Category.objects.create(name='Числа')
+        NumericQuestion.objects.create(category=category, text='Колко?', correct_answer=10)
+        NumericQuestion.objects.create(category=category, text='А сега?', correct_answer=20)
+        attacker = players[0]
+        target = attackable_territories(attacker).first()
+        round_ = create_battle(game.pk, attacker.pk, target.pk)
+        start_round(round_.pk)
+        step = round_.questions.get()
+        right = step.options.get(is_correct=True)
+        # Both answers are already in (as if the auto-evaluation had not run yet): the step may be evaluated.
+        for player in (attacker, target.owner):
+            RoundAnswer.objects.create(
+                round=round_, question=step, player=player, selected_option_id=right.option_id,
+                is_correct=True, submitted_at=timezone.now(),
+            )
+
+        results = run_simultaneously(
+            lambda: evaluate_question(round_.pk, question_id=step.pk),
+            lambda: evaluate_question(round_.pk, question_id=step.pk),
+        )
+
+        self.assertEqual(sum(isinstance(result, RoundStateError) for result in results), 1, results)
+        self.assertEqual(list(round_.questions.values_list('sequence', 'kind')), [(1, 'choice'), (2, 'numeric')])

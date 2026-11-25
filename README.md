@@ -383,3 +383,114 @@ got there first: the transaction is rolled back and the attempt is refused as `i
 constraint "one capture entry per territory" is a last line of defence. On SQLite the
 `IMMEDIATE` transactions serialize the picks (see M05). `ConcurrentCaptureTests` runs two real
 threads for one free territory and for the last pick, and in both cases exactly one succeeds.
+
+## Battles (M08)
+
+`games/battles.py` creates battles and applies their result. The round itself (start, one answer per
+player, 10 s, evaluation, the worker, the limit of 3 questions) is the same shared lifecycle in
+`games/rounds.py` that city capture rounds use. Only the answer check and the "what's next" step
+depend on the kind of question.
+
+### Who fights over what
+
+`create_battle(game_id, attacker_id, target_id, defender_id=None)` is allowed when the game is active,
+every territory has an owner, and there is no unfinished round and no unused pick. The target must be
+another player's territory of the same game that borders something the attacker owns. The "any free
+territory" exception from M07 does not apply here. The defender is always the target's owner; a
+different `defender_id` is refused. A capital makes the round a `capital_attack`, any other territory a
+`battle`. Attacker, defender and target are stored on the `Round`, and the third player cannot answer.
+
+### Questions
+
+| Step | Result | Next step (same round, new 10 s) |
+|---|---|---|
+| choice | one correct answer | its author wins |
+| choice | two correct | numeric question for the same two |
+| choice | none correct (wrong = no answer) | another choice question for the same two |
+| numeric | closer, then faster wins 1st | if tied or unanswered, numeric again (never back to choice) |
+
+Two correct choice answers are not compared by speed. A battle needs only 1st place
+(`places_needed = 1`), so a tie for 2nd never asks a question. A next step is asked only if there is
+no winner yet, the limit of 3 questions allows it, and the bank has a suitable unused question.
+Otherwise the round completes without a winner, with reason `question_limit` (preferred) or
+`bank_exhausted`. A battle with no valid unused choice question to start with is refused without
+changes. A valid choice question has exactly 4 options, exactly one of them correct.
+
+A choice answer is the id of one of the step's own four options. An option of any other question
+(even an existing one) is refused as `invalid_input` and the player can still answer.
+
+### Data: how the different questions are stored
+
+**Chosen:** every step is a `RoundQuestion` with a `kind` (`numeric` / `choice`) and **two separate
+links**, `numeric_question` and `choice_question`. Exactly one link is set, matching the kind, and a
+database constraint enforces it. The bank models stay as they are. What was asked is copied into the
+step: the text and correct number for numeric steps, and the four options into `RoundQuestionOption`
+(text, which one is correct) for choice steps. An answer is a `RoundAnswer` linked to **one step and
+one player** (unique together), holding either `selected_option` or `numeric_value`. A round's history
+is its steps ordered by `sequence`, each with its own kind, options and answers (`round_state()`
+returns it as data). Editing the bank afterwards changes neither the shown history nor the result.
+
+**Same ids in both models:** if `ChoiceQuestion` #777 and `NumericQuestion` #777 both exist, a battle
+can ask the choice one as step 1 and the numeric one as step 2. Step 1 is stored as
+`kind='choice', choice_question_id=777, numeric_question_id=NULL`, step 2 as
+`kind='numeric', numeric_question_id=777, choice_question_id=NULL`. The id never stands alone; it is
+always read through the column of its own model. "Already used in this game" is also checked per model,
+so using choice #777 does not block numeric #777 (`test_same_id_in_both_question_models_stays_unambiguous`).
+
+**Rejected:** one generic link (a `question_id` plus a `question_type`, or a Django `GenericForeignKey`).
+It is shorter, but the database could no longer protect the link (no real foreign key, no `PROTECT`),
+and a bare `question_id = 777` would mean two different questions depending on another column.
+
+### Consequences (value-based scoring, same numbers as M07)
+
+| Result | Map | Points |
+|---|---|---|
+| `battle`, attacker wins | target's owner → attacker; `Territory.score` + 100 (never reset) | attacker: win **150** + conquest = territory value **after** the increase |
+| `battle`, defender wins | nothing changes | defender: win **150** |
+| `capital_attack`, either wins | the capital, its territory, owner and health stay the same | winner: win **150** |
+| no winner | nothing | nothing |
+
+The result, the awards and the target's new owner and score are saved in the same transaction that
+completes the round. Every change is a `ScoreEntry` with before/after values. A database constraint
+allows one win and one conquest entry per round, and re-evaluating a completed round is refused.
+Before the result is applied, the target must still belong to the recorded defender. If it does not,
+applying is refused (`BattleTargetChanged`, an `invalid_state`): no result, no award, no other target.
+Answers accepted earlier stay saved.
+
+### How to run it
+
+```bash
+python backend/manage.py battle <game id> <attacker>                 # what the attacker may attack
+python backend/manage.py battle <game id> <attacker> <target slug>   # create the battle
+python backend/manage.py numeric_round start <round id>
+python backend/manage.py numeric_round answer <round id> <username> <option id or number>
+```
+
+Run on a fresh local database (map shared out, every non-capital territory worth 100):
+
+```
+$ manage.py battle 1 ana balkania
+battle: ana attacks boris
+  Q1 choice [pending] Коя е най-дългата река в България?  players: ana, boris
+$ manage.py numeric_round answer 1 ana 1          (option 1: Искър)
+$ manage.py numeric_round answer 1 cveta 1
+CommandError: [invalid_state] Player #3 is not a participant of the current question.
+$ manage.py numeric_round answer 1 boris 1
+  Q1 choice [completed] ...  ana: Искър (correct), boris: Искър (correct)
+  Q2 numeric [active] Колко метра е връх Мусала?  players: ana, boris  (10.0 s left)
+$ manage.py numeric_round answer 1 ana 2900
+$ manage.py numeric_round answer 1 boris 3000
+  Q2 numeric [completed] ...  ana: 2900, boris: 3000 (correct 2925)
+  Winner: ana
+# Balkania: owner ana, score 200
+# ana round_win: 0 + 150 = 150  (round win = 150)
+# ana conquest: 150 + 200 = 350  (territory 100 + 100 = 200; points = territory value after = 200)
+```
+
+### Two simultaneous attempts after a tie
+
+Evaluating a step first switches it from active to completed with a conditional
+`filter(status='active').update(...)`. Only the attempt that changes the row goes on to create the next
+step; the other one touches 0 rows and changes nothing. Every attempt also locks the round row, and
+`(round, sequence)` is unique. `ConcurrentBattleTieTests` runs two real threads after two correct
+answers and checks that the history holds exactly one numeric step 2.

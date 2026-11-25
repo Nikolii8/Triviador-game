@@ -36,6 +36,13 @@ class ScoringSystem:
     def win(self):
         return self.win_points, f'round win = {self.win_points}'
 
+    def conquest(self, territory_score_before):
+        """A territory taken from another player in a battle (M08): scored like a first-place capture.
+
+        The territory only ever grows (before + increment), so it is never reset when it changes hands.
+        """
+        return self.capture(1, territory_score_before)
+
 
 # Chosen system: a capture is worth what the territory is worth (+100 per capture, value after the
 # increase), and winning the round adds a 150 bonus on top of the extra pick.

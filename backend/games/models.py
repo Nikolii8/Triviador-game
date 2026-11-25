@@ -167,12 +167,18 @@ class Round(models.Model):
         (NUMERIC, 'Numeric'),
     ]
 
-    # Kind of round (M06). Blank for plain M03 rounds that are not run by games.rounds.
-    CITY_CAPTURE = 'city_capture'
+    # Kind of round. Blank for plain M03 rounds that are not run by games.rounds.
+    CITY_CAPTURE = 'city_capture'  # M06/M07: all three players, numeric questions, free territories
+    BATTLE = 'battle'  # M08: attacker vs defender over an ordinary territory
+    CAPITAL_ATTACK = 'capital_attack'  # M08: attacker vs defender over a capital
 
     ROUND_TYPE_CHOICES = [
         (CITY_CAPTURE, 'City capture'),
+        (BATTLE, 'Battle'),
+        (CAPITAL_ATTACK, 'Capital attack'),
     ]
+    BATTLE_TYPES = (BATTLE, CAPITAL_ATTACK)
+    MANAGED_TYPES = (CITY_CAPTURE, BATTLE, CAPITAL_ATTACK)
 
     # Why a completed round has places without a player.
     NOT_ENOUGH_ANSWERS = 'not_enough_answers'
@@ -182,7 +188,7 @@ class Round(models.Model):
     UNRESOLVED_REASON_CHOICES = [
         (NOT_ENOUGH_ANSWERS, 'Not enough accepted answers'),
         (QUESTION_LIMIT, 'Question limit reached'),
-        (BANK_EXHAUSTED, 'No unused numeric question left'),
+        (BANK_EXHAUSTED, 'No suitable unused question left'),
     ]
 
     game = models.ForeignKey(Game, on_delete=models.CASCADE, related_name='rounds')
@@ -224,6 +230,16 @@ class Round(models.Model):
     unresolved_reason = models.CharField(
         max_length=30, choices=UNRESOLVED_REASON_CHOICES, blank=True, default=''
     )
+    # Battles (M08): fixed when the round is created. The defender is the target's owner at that moment.
+    attacker = models.ForeignKey(
+        GamePlayer, null=True, blank=True, on_delete=models.PROTECT, related_name='attacks'
+    )
+    defender = models.ForeignKey(
+        GamePlayer, null=True, blank=True, on_delete=models.PROTECT, related_name='defences'
+    )
+    target = models.ForeignKey(
+        'territories.Territory', null=True, blank=True, on_delete=models.PROTECT, related_name='battles'
+    )
 
     class Meta:
         ordering = ['game', 'number']
@@ -253,14 +269,33 @@ class Round(models.Model):
                 condition=Q(unresolved_reason='') | Q(status='evaluated'),
                 name='round_reason_only_when_evaluated',
             ),
-            # An evaluated city capture has a finish time, and a winner unless a reason says why not.
+            # An evaluated managed round has a finish time, and a winner unless a reason says why not.
             models.CheckConstraint(
-                condition=~Q(round_type='city_capture', status='evaluated', finished_at__isnull=True),
-                name='round_city_capture_evaluated_has_finish_time',
+                condition=~(~Q(round_type='') & Q(status='evaluated', finished_at__isnull=True)),
+                name='round_managed_evaluated_has_finish_time',
             ),
             models.CheckConstraint(
-                condition=~Q(round_type='city_capture', status='evaluated', winner__isnull=True, unresolved_reason=''),
-                name='round_city_capture_no_winner_needs_reason',
+                condition=~(~Q(round_type='') & Q(status='evaluated', winner__isnull=True, unresolved_reason='')),
+                name='round_managed_no_winner_needs_reason',
+            ),
+            # A battle has an attacker, a defender and a target; other rounds have none of them.
+            models.CheckConstraint(
+                condition=(
+                    (
+                        Q(round_type__in=['battle', 'capital_attack'])
+                        & Q(attacker__isnull=False, defender__isnull=False, target__isnull=False)
+                        & ~Q(attacker=F('defender'))
+                    )
+                    | (
+                        ~Q(round_type__in=['battle', 'capital_attack'])
+                        & Q(attacker__isnull=True, defender__isnull=True, target__isnull=True)
+                    )
+                ),
+                name='round_battle_sides_match_type',
+            ),
+            models.CheckConstraint(
+                condition=~Q(round_type__in=['battle', 'capital_attack']) | Q(places_needed=1),
+                name='round_battle_needs_one_place',
             ),
         ]
 
@@ -303,11 +338,27 @@ class Round(models.Model):
         if self.unresolved_reason and not evaluated:
             raise ValidationError({'unresolved_reason': 'Only an evaluated round can have unresolved places.'})
 
-        if self.round_type == self.CITY_CAPTURE:
-            if self.question_type != self.NUMERIC:
-                raise ValidationError('A city capture round uses a numeric question.')
+        if self.round_type == self.CITY_CAPTURE and self.question_type != self.NUMERIC:
+            raise ValidationError('A city capture round uses a numeric question.')
+        if self.round_type in self.BATTLE_TYPES:
+            if self.question_type != self.CHOICE:
+                raise ValidationError('A battle starts with a choice question.')
+            if None in (self.attacker_id, self.defender_id, self.target_id):
+                raise ValidationError('A battle needs an attacker, a defender and a target.')
+            if self.attacker_id == self.defender_id:
+                raise ValidationError({'defender': 'The attacker and the defender must be different players.'})
+            for side in (self.attacker, self.defender):
+                if side.game_id != self.game_id:
+                    raise ValidationError('Both sides of a battle must be players of the same game.')
+            if self.target.game_id != self.game_id:
+                raise ValidationError({'target': 'The target must be a territory of the same game.'})
+            if self.places_needed != 1:
+                raise ValidationError({'places_needed': 'A battle decides only first place.'})
+        elif any((self.attacker_id, self.defender_id, self.target_id)):
+            raise ValidationError('Only a battle has an attacker, a defender and a target.')
+        if self.round_type:
             if not self.places_needed:
-                raise ValidationError({'places_needed': 'A city capture round must fix how many places it decides.'})
+                raise ValidationError({'places_needed': 'A managed round must fix how many places it decides.'})
             if evaluated and self.finished_at is None:
                 raise ValidationError({'finished_at': 'An evaluated round must have a completion time.'})
             if evaluated and self.winner_id is None and not self.unresolved_reason:
@@ -324,11 +375,21 @@ class Round(models.Model):
 
 
 class RoundQuestion(models.Model):
-    """One numeric question asked within a round: the first one, or a tie-break / retry for a group.
+    """One question step of a round: the first one, or a tie-break / retry for a group.
 
-    The question's text and correct answer are copied when it is asked, so later edits in the
-    question bank do not change what was asked or how it is scored.
+    A step is either numeric or a choice question (`kind`). The two bank models stay separate and
+    have separate links, so ChoiceQuestion #5 and NumericQuestion #5 can never be mixed up.
+    What was asked is copied when the step is created (text, correct number, the four options), so
+    later edits in the question bank change neither the history nor the scoring.
     """
+
+    NUMERIC = 'numeric'
+    CHOICE = 'choice'
+
+    KIND_CHOICES = [
+        (NUMERIC, 'Numeric'),
+        (CHOICE, 'Choice'),
+    ]
 
     PENDING = 'pending'
     ACTIVE = 'active'
@@ -342,13 +403,24 @@ class RoundQuestion(models.Model):
 
     round = models.ForeignKey(Round, on_delete=models.CASCADE, related_name='questions')
     sequence = models.PositiveSmallIntegerField()
+    kind = models.CharField(max_length=10, choices=KIND_CHOICES, default=NUMERIC)
     numeric_question = models.ForeignKey(
         NumericQuestion,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name='round_questions',
+    )
+    choice_question = models.ForeignKey(
+        ChoiceQuestion,
+        null=True,
+        blank=True,
         on_delete=models.PROTECT,
         related_name='round_questions',
     )
     text = models.TextField()
-    correct_answer = models.IntegerField()
+    # Numeric steps only; a choice step keeps its correct option in RoundQuestionOption.
+    correct_answer = models.IntegerField(null=True, blank=True)
     participants = models.ManyToManyField(GamePlayer, related_name='round_questions')
     # The places this question decides, e.g. 1-2 for the first question or 2-2 for a tie for second.
     first_place = models.PositiveSmallIntegerField()
@@ -364,6 +436,19 @@ class RoundQuestion(models.Model):
             models.UniqueConstraint(fields=['round', 'sequence'], name='roundquestion_unique_sequence'),
             models.UniqueConstraint(
                 fields=['round', 'numeric_question'], name='roundquestion_unique_bank_question_per_round'
+            ),
+            models.UniqueConstraint(
+                fields=['round', 'choice_question'], name='roundquestion_unique_choice_question_per_round'
+            ),
+            # Exactly the link of its own kind; a numeric step has a number to compare with.
+            models.CheckConstraint(
+                condition=(
+                    Q(kind='numeric', numeric_question__isnull=False, choice_question__isnull=True,
+                      correct_answer__isnull=False)
+                    | Q(kind='choice', choice_question__isnull=False, numeric_question__isnull=True,
+                        correct_answer__isnull=True)
+                ),
+                name='roundquestion_link_matches_kind',
             ),
             models.CheckConstraint(condition=Q(sequence__gte=1, sequence__lte=3), name='roundquestion_sequence_range'),
             models.CheckConstraint(
@@ -390,6 +475,29 @@ class RoundQuestion(models.Model):
 
     def __str__(self) -> str:
         return f'Question {self.sequence} of round {self.round.number} (game #{self.round.game_id})'
+
+
+class RoundQuestionOption(models.Model):
+    """One of the four options of a choice step, as it was when the step was asked."""
+
+    question = models.ForeignKey(RoundQuestion, on_delete=models.CASCADE, related_name='options')
+    option = models.ForeignKey(AnswerOption, on_delete=models.PROTECT, related_name='round_question_options')
+    position = models.PositiveSmallIntegerField()
+    text = models.CharField(max_length=255)
+    is_correct = models.BooleanField()
+
+    class Meta:
+        ordering = ['question', 'position']
+        constraints = [
+            models.UniqueConstraint(fields=['question', 'option'], name='roundquestionoption_unique_option'),
+            models.UniqueConstraint(fields=['question', 'position'], name='roundquestionoption_unique_position'),
+            models.UniqueConstraint(
+                fields=['question'], condition=Q(is_correct=True), name='roundquestionoption_one_correct'
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return self.text
 
 
 class RoundAnswer(models.Model):
@@ -458,7 +566,18 @@ class RoundAnswer(models.Model):
             if not self.question.participants.filter(pk=self.player_id).exists():
                 raise ValidationError({'player': 'Only a participant of the question can answer it.'})
 
-        if self.round.question_type == Round.CHOICE:
+        if self.question_id is not None:
+            # A step answer is checked against its own step, not against the round's first question.
+            if self.question.kind == RoundQuestion.CHOICE:
+                if self.numeric_value is not None:
+                    raise ValidationError({'numeric_value': 'A choice question takes a selected option, not a number.'})
+                if self.selected_option_id is not None and not self.question.options.filter(
+                    option_id=self.selected_option_id
+                ).exists():
+                    raise ValidationError({'selected_option': "The option must be one of this question's options."})
+            elif self.selected_option_id is not None:
+                raise ValidationError({'selected_option': 'A numeric question takes a number, not an option.'})
+        elif self.round.question_type == Round.CHOICE:
             if self.numeric_value is not None:
                 raise ValidationError({'numeric_value': 'A choice round takes a selected option, not a number.'})
             if self.selected_option_id is not None and self.selected_option.question_id != self.round.choice_question_id:
@@ -507,10 +626,12 @@ class ScoreEntry(models.Model):
 
     ROUND_WIN = 'round_win'
     CAPTURE = 'capture'
+    CONQUEST = 'conquest'  # M08: a territory taken from another player in a won battle
 
     KIND_CHOICES = [
         (ROUND_WIN, 'Round win'),
         (CAPTURE, 'Territory capture'),
+        (CONQUEST, 'Territory conquest'),
     ]
 
     player = models.ForeignKey(GamePlayer, on_delete=models.CASCADE, related_name='score_entries')
@@ -534,7 +655,9 @@ class ScoreEntry(models.Model):
         ordering = ['round', 'created_at', 'pk']
         verbose_name_plural = 'score entries'
         constraints = [
-            models.CheckConstraint(condition=Q(kind__in=['round_win', 'capture']), name='scoreentry_kind_valid'),
+            models.CheckConstraint(
+                condition=Q(kind__in=['round_win', 'capture', 'conquest']), name='scoreentry_kind_valid'
+            ),
             models.CheckConstraint(condition=Q(points__gte=1), name='scoreentry_points_positive'),
             models.CheckConstraint(
                 condition=Q(player_score_after=F('player_score_before') + F('points')),
@@ -549,6 +672,12 @@ class ScoreEntry(models.Model):
                         territory__isnull=False,
                         territory_score_after__gt=F('territory_score_before'),
                     )
+                    | Q(
+                        kind='conquest',
+                        right__isnull=True,
+                        territory__isnull=False,
+                        territory_score_after__gt=F('territory_score_before'),
+                    )
                 ),
                 name='scoreentry_fields_match_kind',
             ),
@@ -557,6 +686,9 @@ class ScoreEntry(models.Model):
             ),
             models.UniqueConstraint(
                 fields=['territory'], condition=Q(kind='capture'), name='scoreentry_one_capture_per_territory'
+            ),
+            models.UniqueConstraint(
+                fields=['round'], condition=Q(kind='conquest'), name='scoreentry_one_conquest_per_round'
             ),
         ]
 

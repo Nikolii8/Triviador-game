@@ -40,7 +40,7 @@ class RoundQuestionInline(admin.TabularInline):
 
     model = RoundQuestion
     extra = 0
-    fields = ('sequence', 'status', 'text', 'correct_answer', 'first_place', 'last_place', 'started_at', 'deadline')
+    fields = ('sequence', 'kind', 'status', 'text', 'correct_answer', 'first_place', 'last_place', 'started_at', 'deadline')
     readonly_fields = fields
     can_delete = False
 
@@ -89,10 +89,10 @@ class GamePlayerAdmin(admin.ModelAdmin):
 
 @admin.register(Round)
 class RoundAdmin(admin.ModelAdmin):
-    list_display = ('__str__', 'game', 'number', 'round_type', 'status', 'question_type', 'winner')
+    list_display = ('__str__', 'game', 'number', 'round_type', 'status', 'attacker', 'defender', 'target', 'winner')
     list_filter = ('status', 'question_type', 'round_type')
     readonly_fields = ('question_type',)
-    raw_id_fields = ('game', 'winner')
+    raw_id_fields = ('game', 'winner', 'attacker', 'defender', 'target')
     autocomplete_fields = ('choice_question', 'numeric_question')
     list_select_related = ('game', 'winner__user')
     inlines = [RoundQuestionInline, RoundAnswerInline]

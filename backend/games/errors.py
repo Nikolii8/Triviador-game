@@ -28,3 +28,7 @@ class RoundNotFound(RoundError):
     """The game, round, player or territory does not exist."""
 
     kind = 'not_found'
+
+
+class BattleTargetChanged(RoundStateError):
+    """The battle's target no longer belongs to the recorded defender, so its result cannot be applied."""

@@ -9,9 +9,15 @@ changes or raises a RoundError and changes nothing. The error class tells the ca
 - RoundNotFound      - the game, round or player does not exist.
 
 Round lifecycle (stored statuses in brackets): pending -> active [open] -> completed [evaluated].
-A round asks 1 to 3 numeric questions (RoundQuestion). The first goes to all three players and
-decides places 1..places_needed. A full tie for a needed place, or no answers at all, asks a new
-question to just that group; places already decided are kept.
+A round asks 1 to 3 question steps (RoundQuestion). Start, one answer per player, 10 seconds,
+evaluation and the limit of 3 are shared by every round type and both question kinds; what
+differs is how an answer is checked (number vs option) and what follows a step:
+
+- city capture (M06): numeric only; all three players; a full tie or no answers -> new numeric
+  question for that group; places already decided are kept.
+- battle / capital attack (M08, created in games.battles): starts with a choice question for the
+  attacker and the defender. One correct answer wins; two correct -> numeric question; none
+  correct -> another choice question. Once numeric, it stays numeric (only first place needed).
 """
 
 import random
@@ -19,14 +25,20 @@ import re
 from datetime import timedelta
 
 from django.db import IntegrityError, transaction
-from django.db.models import Max
+from django.db.models import Count, Max, Q
 from django.utils import timezone
 
-from questions.models import NumericQuestion
+from questions.models import ChoiceQuestion, NumericQuestion
 
 from . import capture
-from .errors import InvalidRoundInput, RoundError, RoundNotFound, RoundStateError  # noqa: F401 (re-exported)
-from .models import MAX_PLAYERS, Game, GamePlayer, Round, RoundAnswer, RoundQuestion
+from .errors import (  # noqa: F401 (re-exported)
+    BattleTargetChanged,
+    InvalidRoundInput,
+    RoundError,
+    RoundNotFound,
+    RoundStateError,
+)
+from .models import MAX_PLAYERS, Game, GamePlayer, Round, RoundAnswer, RoundQuestion, RoundQuestionOption
 
 ANSWER_TIME = timedelta(seconds=10)
 MAX_QUESTIONS_PER_ROUND = 3
@@ -112,11 +124,12 @@ def start_round(round_id):
 
 
 def submit_answer(round_id, player_id, value, *, rng=None):
-    """Record `player_id`'s integer answer to the round's active question and return it.
+    """Record `player_id`'s answer to the round's active question step and return it.
 
-    The answer time is taken by the application when the attempt is processed, before the
-    deadline check; it is never supplied by the caller. Once every participant has answered,
-    the question is evaluated right away (see evaluate_question()).
+    `value` is a whole number for a numeric step, or the id of one of the step's own options
+    (an AnswerOption id) for a choice step. The answer time is taken by the application when the
+    attempt is processed, before the deadline check; it is never supplied by the caller. Once
+    every participant has answered, the step is evaluated right away (see evaluate_question()).
     """
     moment = now()  # first thing: the trusted time of this attempt
     with transaction.atomic():
@@ -128,7 +141,12 @@ def submit_answer(round_id, player_id, value, *, rng=None):
                 raise RoundNotFound(f'Player #{player_id} does not exist.')
             raise RoundStateError(f'Player #{player_id} is not a participant of the current question.')
 
-        number = parse_integer_answer(value)
+        if question.kind == RoundQuestion.CHOICE:
+            option = parse_option_answer(question, value)
+            fields = {'selected_option_id': option.option_id, 'is_correct': option.is_correct}
+        else:
+            number = parse_integer_answer(value)
+            fields = {'numeric_value': number, 'is_correct': number == question.correct_answer}
 
         if moment >= question.deadline:
             raise RoundStateError('Time is up: the answer arrived at or after the deadline.')
@@ -138,19 +156,19 @@ def submit_answer(round_id, player_id, value, *, rng=None):
         try:
             with transaction.atomic():
                 answer = RoundAnswer.objects.create(
-                    round=round_,
-                    question=question,
-                    player_id=player_id,
-                    numeric_value=number,
-                    is_correct=number == question.correct_answer,
-                    submitted_at=moment,
+                    round=round_, question=question, player_id=player_id, submitted_at=moment, **fields
                 )
         except IntegrityError:
             # A simultaneous attempt by the same player won the race (unique question+player).
             raise RoundStateError('This player has already answered this question.') from None
 
         if question.answers.count() == question.participants.count():
-            _evaluate(round_, question, moment, rng or random.SystemRandom())
+            try:
+                with transaction.atomic():
+                    _evaluate(round_, question, moment, rng or random.SystemRandom())
+            except BattleTargetChanged:
+                # The answer stays recorded; the result cannot be applied (evaluate_question says why).
+                pass
     return answer
 
 
@@ -205,11 +223,14 @@ def round_state(round_id, *, at=None):
 
     questions = []
     current = None
-    for question in round_.questions.prefetch_related('participants__user', 'answers__player__user'):
+    for question in round_.questions.prefetch_related('participants__user', 'answers__player__user', 'options'):
         data = {
             'sequence': question.sequence,
+            'kind': question.kind,
+            'bank_question': question.choice_question_id or question.numeric_question_id,
             'status': question.status,
             'text': question.text,
+            'options': [{'id': option.option_id, 'text': option.text} for option in question.options.all()],
             'places': [question.first_place, question.last_place],
             'participants': [player.pk for player in question.participants.all()],
             'started_at': question.started_at,
@@ -221,9 +242,18 @@ def round_state(round_id, *, at=None):
             data['remaining_seconds'] = remaining.total_seconds()
             current = data
         else:
-            data['correct_answer'] = question.correct_answer
+            data['correct_answer'] = (
+                question.correct_answer
+                if question.kind == RoundQuestion.NUMERIC
+                else next((o.option_id for o in question.options.all() if o.is_correct), None)
+            )
             data['answers'] = [
-                {'player': answer.player_id, 'value': answer.numeric_value, 'submitted_at': answer.submitted_at}
+                {
+                    'player': answer.player_id,
+                    'value': answer.numeric_value if question.kind == RoundQuestion.NUMERIC else answer.selected_option_id,
+                    'is_correct': answer.is_correct,
+                    'submitted_at': answer.submitted_at,
+                }
                 for answer in question.answers.all()
             ]
         questions.append(data)
@@ -233,6 +263,9 @@ def round_state(round_id, *, at=None):
         'game': round_.game_id,
         'number': round_.number,
         'type': round_.round_type,
+        'attacker': round_.attacker_id,
+        'defender': round_.defender_id,
+        'target': round_.target_id,
         'status': round_.status,
         'places_needed': round_.places_needed,
         'started_at': round_.started_at,
@@ -260,6 +293,22 @@ def parse_integer_answer(value):
     return number
 
 
+def parse_option_answer(question, value):
+    """Return the step's own option chosen by `value` (an AnswerOption id), or raise InvalidRoundInput.
+
+    Only the four options copied into this step are accepted: an existing option of another
+    question is just as invalid as a made-up id.
+    """
+    try:
+        option_id = parse_integer_answer(value)
+    except InvalidRoundInput:
+        raise InvalidRoundInput(f'The answer must be the id of one of the options (got {value!r}).') from None
+    option = question.options.filter(option_id=option_id).first()
+    if option is None:
+        raise InvalidRoundInput(f'Option #{option_id} is not one of the options of this question.')
+    return option
+
+
 # --- internals -------------------------------------------------------------------------------
 
 
@@ -269,13 +318,13 @@ def _ensure_game_is_active(game):
 
 
 def _lock_round(round_id):
-    """Lock and return a city capture round of an active game."""
+    """Lock and return a round of an active game that this module runs (city capture or battle)."""
     try:
         round_ = Round.objects.select_for_update().select_related('game').get(pk=round_id)
     except Round.DoesNotExist:
         raise RoundNotFound(f'Round #{round_id} does not exist.') from None
-    if round_.round_type != Round.CITY_CAPTURE:
-        raise RoundStateError(f'Round #{round_.pk} is not a numeric city capture round.')
+    if round_.round_type not in Round.MANAGED_TYPES:
+        raise RoundStateError(f'Round #{round_.pk} is not run by the round service.')
     _ensure_game_is_active(round_.game)
     return round_
 
@@ -288,35 +337,66 @@ def _active_question(round_):
     return round_.questions.get(status=RoundQuestion.ACTIVE)
 
 
-def _used_question_ids(game):
-    used = set(RoundQuestion.objects.filter(round__game=game).values_list('numeric_question_id', flat=True))
-    used |= set(game.rounds.filter(numeric_question__isnull=False).values_list('numeric_question_id', flat=True))
+def _used_question_ids(game, kind=RoundQuestion.NUMERIC):
+    """Ids of `kind` bank questions already used in the game. Each model has its own id space."""
+    field = 'numeric_question_id' if kind == RoundQuestion.NUMERIC else 'choice_question_id'
+    used = set(RoundQuestion.objects.filter(round__game=game).values_list(field, flat=True))
+    used |= set(game.rounds.values_list(field, flat=True))
+    used.discard(None)
     return used
 
 
-def _pick_unused_question(game, rng):
+def _pick_unused_question(game, rng, kind=RoundQuestion.NUMERIC):
+    """A random valid bank question of `kind` not used in this game yet, or None."""
+    if kind == RoundQuestion.NUMERIC:
+        queryset = NumericQuestion.objects.all()
+        model = NumericQuestion
+    else:
+        # Valid: exactly four options, exactly one of them correct.
+        queryset = ChoiceQuestion.objects.annotate(
+            option_count=Count('answer_options'),
+            correct_count=Count('answer_options', filter=Q(answer_options__is_correct=True)),
+        ).filter(option_count=4, correct_count=1)
+        model = ChoiceQuestion
     candidates = [
         pk
-        for pk, text in NumericQuestion.objects.exclude(pk__in=_used_question_ids(game))
-        .order_by('pk')
-        .values_list('pk', 'text')
+        for pk, text in queryset.exclude(pk__in=_used_question_ids(game, kind)).order_by('pk').values_list('pk', 'text')
         if text.strip()
     ]
     if not candidates:
         return None
-    return NumericQuestion.objects.get(pk=rng.choice(candidates))
+    return model.objects.get(pk=rng.choice(candidates))
 
 
 def _ask(round_, sequence, bank_question, players, *, first_place, last_place, start_at=None):
-    question = RoundQuestion.objects.create(
-        round=round_,
-        sequence=sequence,
-        numeric_question=bank_question,
-        text=bank_question.text,
-        correct_answer=bank_question.correct_answer,
-        first_place=first_place,
-        last_place=last_place,
-    )
+    """Create a question step from `bank_question` (numeric or choice), copying what is asked."""
+    if isinstance(bank_question, ChoiceQuestion):
+        question = RoundQuestion.objects.create(
+            round=round_,
+            sequence=sequence,
+            kind=RoundQuestion.CHOICE,
+            choice_question=bank_question,
+            text=bank_question.text,
+            first_place=first_place,
+            last_place=last_place,
+        )
+        RoundQuestionOption.objects.bulk_create(
+            RoundQuestionOption(
+                question=question, option=option, position=position, text=option.text, is_correct=option.is_correct
+            )
+            for position, option in enumerate(bank_question.answer_options.order_by('pk'), start=1)
+        )
+    else:
+        question = RoundQuestion.objects.create(
+            round=round_,
+            sequence=sequence,
+            kind=RoundQuestion.NUMERIC,
+            numeric_question=bank_question,
+            text=bank_question.text,
+            correct_answer=bank_question.correct_answer,
+            first_place=first_place,
+            last_place=last_place,
+        )
     question.participants.set(players)
     if start_at is not None:
         _activate(question, start_at)
@@ -345,6 +425,9 @@ def _evaluate(round_, question, moment, rng):
         return False
     question.status, question.completed_at = RoundQuestion.COMPLETED, moment
 
+    if question.kind == RoundQuestion.CHOICE:
+        return _evaluate_choice(round_, question, moment, rng)
+
     def key(answer):
         # Closer first; at equal closeness, faster first. Both sides of the answer count the same.
         return abs(answer.numeric_value - question.correct_answer), answer.submitted_at
@@ -371,10 +454,33 @@ def _evaluate(round_, question, moment, rng):
         _complete(round_, moment, reason='')
         return True
 
-    if question.sequence >= MAX_QUESTIONS_PER_ROUND:
-        _complete(round_, moment, reason=Round.QUESTION_LIMIT)
+    # Once numeric, a round stays numeric: the next step (if any) is numeric too.
+    return _next_step(round_, question, moment, rng, RoundQuestion.NUMERIC, group, places)
+
+
+def _evaluate_choice(round_, question, moment, rng):
+    """Choice step: one correct answer wins; two -> numeric step; none -> another choice step.
+
+    A wrong answer counts the same as no answer, and correct answers are not compared by speed.
+    """
+    correct = [answer for answer in question.answers.select_related('player') if answer.is_correct]
+    places = (question.first_place, question.last_place)
+    if len(correct) == 1:
+        correct[0].place = question.first_place
+        correct[0].save(update_fields=['place'])
+        _complete(round_, moment, reason='')
         return True
-    bank_question = _pick_unused_question(round_.game, rng)
+    if correct:
+        return _next_step(round_, question, moment, rng, RoundQuestion.NUMERIC, [a.player for a in correct], places)
+    return _next_step(round_, question, moment, rng, RoundQuestion.CHOICE, list(question.participants.all()), places)
+
+
+def _next_step(round_, question, moment, rng, kind, group, places):
+    """Ask the next step if the limit allows it and the bank has one; otherwise complete with the reason."""
+    if question.sequence >= MAX_QUESTIONS_PER_ROUND:
+        _complete(round_, moment, reason=Round.QUESTION_LIMIT)  # takes precedence over an empty bank
+        return True
+    bank_question = _pick_unused_question(round_.game, rng, kind)
     if bank_question is None:
         _complete(round_, moment, reason=Round.BANK_EXHAUSTED)
         return True
@@ -400,5 +506,10 @@ def _complete(round_, moment, *, reason):
     round_.unresolved_reason = reason if len(placed) < round_.places_needed else ''
     round_.full_clean()
     round_.save(update_fields=['status', 'finished_at', 'winner', 'unresolved_reason'])
-    # Same transaction: the final ranking, the win award and the capture rights are saved together.
-    capture.record_round_result(round_)
+    # Same transaction: the final ranking and every consequence are saved together, or not at all.
+    if round_.round_type == Round.CITY_CAPTURE:
+        capture.record_round_result(round_)
+    else:
+        from .battles import apply_battle_result  # battles builds on this module
+
+        apply_battle_result(round_)

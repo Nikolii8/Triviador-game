@@ -59,7 +59,7 @@ def record_round_result(round_, system=ACTIVE_SYSTEM):
     """Award the win and create the capture rights of an evaluated round. Call once, inside its transaction."""
     if round_.winner_id is None:
         return  # no winner: no award, no rights; the free territories wait for the next round
-    _credit(
+    credit(
         round_.winner,
         round_,
         ScoreEntry.ROUND_WIN,
@@ -126,7 +126,7 @@ def choose_territory(game_id, player_id, territory_id, *, system=ACTIVE_SYSTEM):
 
         territory_before = territory.score
         territory.owner, territory.score = player, territory_after
-        return _credit(
+        return credit(
             player,
             right.round,
             ScoreEntry.CAPTURE,
@@ -158,7 +158,7 @@ def capture_state(game):
     }
 
 
-def _credit(player, round_, kind, points, calculation, *, right=None, territory=None, territory_before=None,
+def credit(player, round_, kind, points, calculation, *, right=None, territory=None, territory_before=None,
             territory_after=None):
     """Add `points` to the player's score and record the change with its before/after values."""
     player.refresh_from_db(fields=['score'])
