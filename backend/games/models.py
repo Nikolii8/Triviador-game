@@ -91,7 +91,7 @@ class GamePlayer(models.Model):
             models.CheckConstraint(
                 condition=Q(player_order__gte=1, player_order__lte=MAX_PLAYERS),
                 name='gameplayer_order_in_range',
-            ),
+            ),            models.CheckConstraint(condition=Q(score__gte=0), name='gameplayer_score_non_negative'),
         ]
 
     def __str__(self) -> str:
@@ -191,6 +191,8 @@ class Round(models.Model):
     round_type = models.CharField(max_length=20, choices=ROUND_TYPE_CHOICES, blank=True, default='')
     # How many places the round decides (1st, 2nd, ...). Fixed when the round is created.
     places_needed = models.PositiveSmallIntegerField(null=True, blank=True)
+    # Free territories when the round was created (M07): fixes places_needed and the capture rights.
+    free_territories = models.PositiveSmallIntegerField(null=True, blank=True)
     # Kept in sync automatically in save(): it is derived from whichever question is set,
     # never entered by hand, so it cannot disagree with the question.
     question_type = models.CharField(max_length=20, choices=QUESTION_TYPE_CHOICES, editable=False)
@@ -463,3 +465,100 @@ class RoundAnswer(models.Model):
                 raise ValidationError({'selected_option': "The option must belong to the round's question."})
         elif self.selected_option_id is not None:
             raise ValidationError({'selected_option': 'A numeric round takes a number, not an option.'})
+
+
+class CaptureRight(models.Model):
+    """The right of one ranked player to pick free territories after a city capture round (M07).
+
+    Created once, when the round is evaluated: the first picks up to two, then the second up to one.
+    """
+
+    round = models.ForeignKey(Round, on_delete=models.CASCADE, related_name='capture_rights')
+    player = models.ForeignKey(GamePlayer, on_delete=models.CASCADE, related_name='capture_rights')
+    # 1 = picks first (the round winner), 2 = picks after the first has used all their picks.
+    turn = models.PositiveSmallIntegerField()
+    allowed = models.PositiveSmallIntegerField()
+    used = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        ordering = ['round', 'turn']
+        constraints = [
+            models.UniqueConstraint(fields=['round', 'player'], name='captureright_unique_player_per_round'),
+            models.UniqueConstraint(fields=['round', 'turn'], name='captureright_unique_turn_per_round'),
+            models.CheckConstraint(condition=Q(turn__gte=1, turn__lte=2), name='captureright_turn_range'),
+            models.CheckConstraint(condition=Q(allowed__gte=1, allowed__lte=2), name='captureright_allowed_range'),
+            models.CheckConstraint(condition=Q(used__lte=F('allowed')), name='captureright_used_within_allowed'),
+        ]
+
+    def __str__(self) -> str:
+        return f'{self.player.user}: {self.used}/{self.allowed} picks after round {self.round.number}'
+
+    @property
+    def remaining(self):
+        return self.allowed - self.used
+
+
+class ScoreEntry(models.Model):
+    """One score change with the values before and after it and how it was calculated (M07).
+
+    The ledger is also what makes every award one-off: one win entry per round, one capture
+    entry per territory.
+    """
+
+    ROUND_WIN = 'round_win'
+    CAPTURE = 'capture'
+
+    KIND_CHOICES = [
+        (ROUND_WIN, 'Round win'),
+        (CAPTURE, 'Territory capture'),
+    ]
+
+    player = models.ForeignKey(GamePlayer, on_delete=models.CASCADE, related_name='score_entries')
+    round = models.ForeignKey(Round, on_delete=models.CASCADE, related_name='score_entries')
+    kind = models.CharField(max_length=20, choices=KIND_CHOICES)
+    right = models.ForeignKey(
+        CaptureRight, null=True, blank=True, on_delete=models.CASCADE, related_name='score_entries'
+    )
+    territory = models.ForeignKey(
+        'territories.Territory', null=True, blank=True, on_delete=models.CASCADE, related_name='score_entries'
+    )
+    points = models.PositiveIntegerField()
+    player_score_before = models.PositiveIntegerField()
+    player_score_after = models.PositiveIntegerField()
+    territory_score_before = models.PositiveIntegerField(null=True, blank=True)
+    territory_score_after = models.PositiveIntegerField(null=True, blank=True)
+    calculation = models.CharField(max_length=200)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['round', 'created_at', 'pk']
+        verbose_name_plural = 'score entries'
+        constraints = [
+            models.CheckConstraint(condition=Q(kind__in=['round_win', 'capture']), name='scoreentry_kind_valid'),
+            models.CheckConstraint(condition=Q(points__gte=1), name='scoreentry_points_positive'),
+            models.CheckConstraint(
+                condition=Q(player_score_after=F('player_score_before') + F('points')),
+                name='scoreentry_player_after_is_before_plus_points',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(kind='round_win', right__isnull=True, territory__isnull=True, territory_score_before__isnull=True)
+                    | Q(
+                        kind='capture',
+                        right__isnull=False,
+                        territory__isnull=False,
+                        territory_score_after__gt=F('territory_score_before'),
+                    )
+                ),
+                name='scoreentry_fields_match_kind',
+            ),
+            models.UniqueConstraint(
+                fields=['round'], condition=Q(kind='round_win'), name='scoreentry_one_win_per_round'
+            ),
+            models.UniqueConstraint(
+                fields=['territory'], condition=Q(kind='capture'), name='scoreentry_one_capture_per_territory'
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f'{self.player.user} +{self.points} ({self.get_kind_display()}, round {self.round.number})'

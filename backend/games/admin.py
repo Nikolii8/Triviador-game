@@ -3,7 +3,7 @@ from django.contrib import admin, messages
 from territories.models import Capital, Territory
 
 from .initialization import GameInitializationError, initialize_game
-from .models import Game, GamePlayer, Round, RoundAnswer, RoundQuestion
+from .models import CaptureRight, Game, GamePlayer, Round, RoundAnswer, RoundQuestion, ScoreEntry
 
 
 class GamePlayerInline(admin.TabularInline):
@@ -104,3 +104,32 @@ class RoundAnswerAdmin(admin.ModelAdmin):
     list_filter = ('is_correct', 'round__question_type')
     raw_id_fields = ('round', 'player', 'question', 'selected_option')
     list_select_related = ('round', 'player__user')
+
+
+class ReadOnlyAdmin(admin.ModelAdmin):
+    """Written only by games.rounds / games.capture; the admin shows the history."""
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(CaptureRight)
+class CaptureRightAdmin(ReadOnlyAdmin):
+    list_display = ('round', 'player', 'turn', 'allowed', 'used')
+    list_filter = ('round__game',)
+    list_select_related = ('round', 'player__user')
+
+
+@admin.register(ScoreEntry)
+class ScoreEntryAdmin(ReadOnlyAdmin):
+    list_display = (
+        'player', 'kind', 'round', 'territory', 'points', 'player_score_before', 'player_score_after', 'calculation'
+    )
+    list_filter = ('kind', 'round__game')
+    list_select_related = ('player__user', 'round', 'territory')

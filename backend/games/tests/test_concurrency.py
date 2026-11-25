@@ -6,14 +6,18 @@ on PostgreSQL by select_for_update() on the game row. See README for the limits.
 """
 
 import threading
+from datetime import timedelta
+from unittest import mock
 
 from django.db import connection
 from django.test import TransactionTestCase
 from django.utils import timezone
 
 from games.initialization import GameInitializationError, initialize_game
-from games.models import Game, GamePlayer, RoundAnswer
-from games.rounds import RoundStateError, create_round, start_round, submit_answer
+from games.capture import allowed_territories, choose_territory
+from games.models import CaptureRight, Game, GamePlayer, RoundAnswer, ScoreEntry
+from games import rounds
+from games.rounds import RoundStateError, create_round, evaluate_question, start_round, submit_answer
 from questions.models import Category, NumericQuestion
 from territories.map_definition import PROJECT_MAP
 from territories.models import Capital, Territory
@@ -91,7 +95,7 @@ class ConcurrentAnswerTests(TransactionTestCase):
     def test_only_one_answer_is_accepted(self):
         game = make_game(make_user('host'))
         players = [add_player(game, f'p{order}', order) for order in (1, 2, 3)]
-        Game.objects.filter(pk=game.pk).update(status=Game.IN_PROGRESS, started_at=timezone.now())
+        initialize_game(game.pk)
         category = Category.objects.create(name='Числа')
         NumericQuestion.objects.create(category=category, text='Колко?', correct_answer=10)
         round_ = create_round(game.pk)
@@ -107,3 +111,84 @@ class ConcurrentAnswerTests(TransactionTestCase):
         self.assertEqual((len(accepted), len(refused)), (1, 1), results)
         stored = RoundAnswer.objects.get(round=round_, player=players[0])
         self.assertEqual(stored.numeric_value, accepted[0].numeric_value)
+
+
+class ConcurrentCloseExpiredTests(TransactionTestCase):
+    """Two copies of close_expired_rounds evaluating the same expired question at once."""
+
+    def test_question_is_evaluated_once(self):
+        game = make_game(make_user('host'))
+        players = [add_player(game, f'p{order}', order) for order in (1, 2, 3)]
+        initialize_game(game.pk)
+        category = Category.objects.create(name='Числа')
+        NumericQuestion.objects.create(category=category, text='Колко?', correct_answer=10)
+        NumericQuestion.objects.create(category=category, text='А сега?', correct_answer=20)
+        round_ = create_round(game.pk)
+        start_round(round_.pk)
+        submit_answer(round_.pk, players[0].pk, 10)
+        question = round_.questions.get()
+
+        later = timezone.now() + timedelta(seconds=30)
+        with mock.patch.object(rounds, 'now', lambda: later):
+            results = run_simultaneously(
+                lambda: evaluate_question(round_.pk, question_id=question.pk),
+                lambda: evaluate_question(round_.pk, question_id=question.pk),
+            )
+
+        refused = [result for result in results if isinstance(result, RoundStateError)]
+        self.assertEqual(len(refused), 1, results)
+        round_.refresh_from_db()
+        self.assertEqual(round_.status, round_.EVALUATED)
+        self.assertEqual(round_.questions.count(), 1)
+        self.assertEqual(RoundAnswer.objects.filter(round=round_, place__isnull=False).count(), 1)
+
+
+class ConcurrentCaptureTests(TransactionTestCase):
+    """M07 upgrade: simultaneous picks of one free territory and of the last capture right."""
+
+    def setUp(self):
+        self.game = make_game(make_user('host'))
+        self.players = [add_player(self.game, f'p{order}', order) for order in (1, 2, 3)]
+        initialize_game(self.game.pk)
+        category = Category.objects.create(name='Числа')
+        NumericQuestion.objects.create(category=category, text='Колко?', correct_answer=10)
+        round_ = create_round(self.game.pk)
+        start_round(round_.pk)
+        first, second, third = self.players
+        submit_answer(round_.pk, first.pk, 10)
+        submit_answer(round_.pk, second.pk, 12)
+        submit_answer(round_.pk, third.pk, 50)  # first: 2 picks, then second: 1 pick
+
+    def test_one_free_territory_is_taken_once(self):
+        first = self.players[0]
+        target = allowed_territories(first).first()
+
+        results = run_simultaneously(
+            lambda: choose_territory(self.game.pk, first.pk, target.pk),
+            lambda: choose_territory(self.game.pk, first.pk, target.pk),
+        )
+
+        self.assertEqual(sum(isinstance(r, ScoreEntry) for r in results), 1, results)
+        self.assertEqual(sum(isinstance(r, RoundStateError) for r in results), 1, results)
+        self.assertEqual(ScoreEntry.objects.filter(territory=target).count(), 1)
+        self.assertEqual(CaptureRight.objects.get(player=first).used, 1)
+
+    def test_last_right_is_used_once(self):
+        first, second, third = self.players
+        for _ in range(2):
+            choose_territory(self.game.pk, first.pk, allowed_territories(first).first().pk)
+        # Capitals are random, so make both targets valid regardless of the map: give the second's
+        # free neighbors to the third (test setup), which lets the second pick any free territory.
+        free = Territory.objects.filter(game=self.game, owner__isnull=True)
+        free.filter(neighbors__owner=second).update(owner=third)
+        targets = list(free.order_by('pk')[:2])
+        self.assertEqual(set(allowed_territories(second)), set(free))
+
+        results = run_simultaneously(
+            lambda: choose_territory(self.game.pk, second.pk, targets[0].pk),
+            lambda: choose_territory(self.game.pk, second.pk, targets[1].pk),
+        )
+
+        self.assertEqual(sum(isinstance(r, ScoreEntry) for r in results), 1, results)
+        self.assertEqual(CaptureRight.objects.get(player=second).used, 1)
+        self.assertEqual(Territory.objects.filter(owner=second).count(), 2)  # capital + exactly one pick

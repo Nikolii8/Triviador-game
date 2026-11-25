@@ -18,13 +18,14 @@ import random
 import re
 from datetime import timedelta
 
-from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import Max
 from django.utils import timezone
 
 from questions.models import NumericQuestion
 
+from . import capture
+from .errors import InvalidRoundInput, RoundError, RoundNotFound, RoundStateError  # noqa: F401 (re-exported)
 from .models import MAX_PLAYERS, Game, GamePlayer, Round, RoundAnswer, RoundQuestion
 
 ANSWER_TIME = timedelta(seconds=10)
@@ -39,24 +40,6 @@ _INT_MIN, _INT_MAX = -(2**31), 2**31 - 1  # what an IntegerField holds on every 
 def now():
     """The trusted current time. The only clock this module uses, so tests can replace it."""
     return timezone.now()
-
-
-class RoundError(ValidationError):
-    """A refused round operation. Nothing was changed when it is raised."""
-
-    kind = 'error'
-
-
-class InvalidRoundInput(RoundError):
-    kind = 'invalid_input'
-
-
-class RoundStateError(RoundError):
-    kind = 'invalid_state'
-
-
-class RoundNotFound(RoundError):
-    kind = 'not_found'
 
 
 # --- operations ------------------------------------------------------------------------------
@@ -84,18 +67,25 @@ def create_round(game_id, *, round_type=Round.CITY_CAPTURE, rng=None):
             raise RoundStateError(f'A round needs the game\'s {MAX_PLAYERS} players (game #{game.pk} has {len(players)}).')
         if game.rounds.exclude(status=Round.EVALUATED).exists():
             raise RoundStateError(f'Game #{game.pk} already has an unfinished round.')
+        if capture.pending_right(game) is not None:
+            raise RoundStateError(f'Game #{game.pk} still has territory picks to make from the last round.')
+        free_count = capture.free_territories(game).count()
+        if free_count == 0:
+            raise RoundStateError(f'Game #{game.pk} has no free territory left: the conquest phase is over.')
 
         question = _pick_unused_question(game, rng)
         if question is None:
             raise RoundStateError('No unused numeric question is left for this game.')
 
         number = (game.rounds.aggregate(highest=Max('number'))['highest'] or 0) + 1
-        places_needed = PLACES_NEEDED[round_type]
+        # Fixed before the start: how many places are worth deciding depends on the free territories.
+        places_needed = min(PLACES_NEEDED[round_type], capture.places_needed_for(free_count))
         round_ = Round(
             game=game,
             number=number,
             round_type=round_type,
             places_needed=places_needed,
+            free_territories=free_count,
             numeric_question=question,
         )
         round_.full_clean()
@@ -164,22 +154,42 @@ def submit_answer(round_id, player_id, value, *, rng=None):
     return answer
 
 
-def evaluate_question(round_id, *, rng=None):
+def evaluate_question(round_id, *, question_id=None, rng=None):
     """Evaluate the round's active question without a new answer and return the round.
 
     Allowed once every participant has answered or the deadline has passed; earlier it is
     refused. Either decides the ranking and completes the round, or asks the next question.
+
+    With `question_id` (used by the close_expired_rounds worker) only that question is evaluated:
+    if it has meanwhile been closed by someone else, nothing changes and RoundStateError says so.
     """
     with transaction.atomic():
         moment = now()
         round_ = _lock_round(round_id)
-        question = _active_question(round_)
+        if question_id is None:
+            question = _active_question(round_)
+        else:
+            try:
+                question = round_.questions.get(pk=question_id)
+            except RoundQuestion.DoesNotExist:
+                raise RoundNotFound(f'Question #{question_id} does not exist in round #{round_id}.') from None
+        if question.status != RoundQuestion.ACTIVE:
+            raise RoundStateError('This question is not active: it has already been closed.')
         answered = question.answers.count()
         if moment < question.deadline and answered < question.participants.count():
             raise RoundStateError('The question is still running: not everyone has answered and time is not up.')
-        _evaluate(round_, question, moment, rng or random.SystemRandom())
+        if not _evaluate(round_, question, moment, rng or random.SystemRandom()):
+            raise RoundStateError('This question was closed by another process in the meantime.')
     round_.refresh_from_db()
     return round_
+
+
+def expired_questions(moment=None):
+    """Active questions whose deadline has passed, including any missed while nothing was running."""
+    return RoundQuestion.objects.filter(
+        status=RoundQuestion.ACTIVE,
+        deadline__lte=moment or now(),
+    ).order_by('deadline', 'pk')
 
 
 def round_state(round_id, *, at=None):
@@ -321,10 +331,19 @@ def _activate(question, moment):
 
 
 def _evaluate(round_, question, moment, rng):
-    """Close `question`, record the places it decides, then ask the next question or complete the round."""
-    question.status = RoundQuestion.COMPLETED
-    question.completed_at = moment
-    question.save(update_fields=['status', 'completed_at'])
+    """Close `question`, record the places it decides, then ask the next question or complete the round.
+
+    Must run inside the caller's transaction. Returns False and changes nothing if the question
+    was no longer active, i.e. someone else has already evaluated it.
+    """
+    # Conditional change: only switches active -> completed if it is active at this very moment
+    # in the database. 0 rows means another process got there first, so do nothing at all.
+    closed = RoundQuestion.objects.filter(pk=question.pk, status=RoundQuestion.ACTIVE).update(
+        status=RoundQuestion.COMPLETED, completed_at=moment
+    )
+    if closed == 0:
+        return False
+    question.status, question.completed_at = RoundQuestion.COMPLETED, moment
 
     def key(answer):
         # Closer first; at equal closeness, faster first. Both sides of the answer count the same.
@@ -350,15 +369,15 @@ def _evaluate(round_, question, moment, rng):
     else:
         # Done. Places left over here had too few answers and are not awarded.
         _complete(round_, moment, reason='')
-        return
+        return True
 
     if question.sequence >= MAX_QUESTIONS_PER_ROUND:
         _complete(round_, moment, reason=Round.QUESTION_LIMIT)
-        return
+        return True
     bank_question = _pick_unused_question(round_.game, rng)
     if bank_question is None:
         _complete(round_, moment, reason=Round.BANK_EXHAUSTED)
-        return
+        return True
     _ask(
         round_,
         question.sequence + 1,
@@ -368,6 +387,7 @@ def _evaluate(round_, question, moment, rng):
         last_place=places[1],
         start_at=moment,
     )
+    return True
 
 
 def _complete(round_, moment, *, reason):
@@ -380,3 +400,5 @@ def _complete(round_, moment, *, reason):
     round_.unresolved_reason = reason if len(placed) < round_.places_needed else ''
     round_.full_clean()
     round_.save(update_fields=['status', 'finished_at', 'winner', 'unresolved_reason'])
+    # Same transaction: the final ranking, the win award and the capture rights are saved together.
+    capture.record_round_result(round_)

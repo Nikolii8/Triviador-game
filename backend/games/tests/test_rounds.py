@@ -11,9 +11,11 @@ from unittest import mock
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django.db import transaction
 from django.test import TestCase
 
-from games import rounds
+from games import capture, rounds
+from games.initialization import initialize_game
 from games.models import Game, Round, RoundAnswer, RoundQuestion
 from games.rounds import (
     InvalidRoundInput,
@@ -50,6 +52,9 @@ class FirstChoice:
     def choice(self, items):
         return items[0]
 
+    def sample(self, items, k):
+        return list(items)[:k]
+
 
 def make_bank(*answers):
     category, _ = Category.objects.get_or_create(name='Числа')
@@ -73,7 +78,7 @@ class RoundTestCase(TestCase):
         self.a = add_player(self.game, 'ana', 1)
         self.b = add_player(self.game, 'boris', 2)
         self.c = add_player(self.game, 'cveta', 3)
-        Game.objects.filter(pk=self.game.pk).update(status=Game.IN_PROGRESS, started_at=T0)
+        initialize_game(self.game.pk)  # M05: map, capitals, status in progress
         self.game.refresh_from_db()
 
     def started_round(self, *bank_answers):
@@ -90,6 +95,12 @@ class RoundTestCase(TestCase):
     def evaluate(self, round_, at):
         self.clock.at(at)
         return evaluate_question(round_.pk)
+
+    def use_all_picks(self):
+        """Make every pending territory pick (M07), so the next round may be created."""
+        while (right := capture.pending_right(self.game)) is not None:
+            territory = capture.allowed_territories(right.player).first()
+            capture.choose_territory(self.game.pk, right.player_id, territory.pk)
 
     def places(self, round_):
         return [(answer.place, answer.player) for answer in round_.ranking()]
@@ -170,7 +181,9 @@ class WorkflowTests(RoundTestCase):
 
     def test_every_changing_operation_needs_an_active_game(self):
         round_ = self.started_round(100)
-        Game.objects.filter(pk=self.game.pk).update(status=Game.FINISHED, finished_at=T0 + timedelta(seconds=1))
+        Game.objects.filter(pk=self.game.pk).update(
+            status=Game.FINISHED, finished_at=self.game.started_at + timedelta(seconds=1)
+        )
 
         with self.assertRaises(RoundStateError):
             self.answer(round_, self.a, 100, at=1)
@@ -529,6 +542,7 @@ class DataTests(RoundTestCase):
         self.answer(round_, self.a, 50, at=11)
         self.answer(round_, self.b, 1, at=11)
         self.answer(round_, self.c, 2, at=11)  # decided on question 2
+        self.use_all_picks()
 
         # Questions 1 and 2 were both used by round 1, so round 2 can only get question 3 ...
         second_round = create_round(self.game.pk)
@@ -594,3 +608,104 @@ class CommandTests(RoundTestCase):
         self.assertIn('Place 1: ana', output)
         self.assertIn('Place 2: boris', output)
         self.assertIn('Winner: ana', output)
+
+
+class CloseExpiredRoundsTests(RoundTestCase):
+    """The close_expired_rounds worker command (background tasks exercise)."""
+
+    def run_command(self, *args):
+        out = StringIO()
+        call_command('close_expired_rounds', *args, stdout=out)
+        return out.getvalue()
+
+    def test_finds_expired_and_missed_questions_only(self):
+        expired = self.started_round(100).questions.get()
+        other_game = make_game(make_user('host2'))
+        for order, name in enumerate(('x', 'y', 'z'), start=1):
+            add_player(other_game, name, order)
+        initialize_game(other_game.pk)
+        make_bank(5)
+        self.clock.at(30)
+        running = create_round(other_game.pk)
+        start_round(running.pk)  # deadline T0 + 40 s
+
+        self.assertEqual(list(rounds.expired_questions()), [expired])  # 20 s overdue, still found
+        self.clock.at(40)  # exactly at the deadline counts as expired
+        self.assertEqual(len(rounds.expired_questions()), 2)
+
+    def test_processes_expired_question_with_the_m06_rules(self):
+        round_ = self.started_round(100)
+        self.answer(round_, self.a, 99, at=1)
+        self.answer(round_, self.b, 90, at=2)
+
+        self.clock.at(9.9)
+        self.assertIn('processed: 0, skipped: 0', self.run_command())
+        self.clock.at(25)
+        output = self.run_command()
+
+        self.assertIn('expired questions: 1, processed: 1, skipped: 0', output)
+        round_.refresh_from_db()
+        self.assertEqual(round_.status, Round.EVALUATED)
+        self.assertEqual(self.places(round_), [(1, self.a), (2, self.b)])
+
+    def test_expired_question_can_lead_to_a_follow_up(self):
+        round_ = self.started_round(100, 50)
+        self.clock.at(12)
+        self.run_command()  # nobody answered: new question for everyone, its own 10 s
+
+        second = round_.questions.get(sequence=2)
+        self.assertEqual(second.status, RoundQuestion.ACTIVE)
+        self.assertEqual(second.deadline, T0 + timedelta(seconds=22))
+        self.assertIn('processed: 0', self.run_command())  # not expired yet
+
+    def test_running_twice_changes_nothing_more(self):
+        round_ = self.started_round(100)
+        self.answer(round_, self.a, 100, at=1)
+        self.clock.at(10)
+        self.run_command()
+        round_.refresh_from_db()
+        before = (round_.status, round_.winner, round_.finished_at, self.places(round_))
+
+        self.clock.at(50)
+        self.assertIn('expired questions: 0', self.run_command())
+
+        round_.refresh_from_db()
+        self.assertEqual((round_.status, round_.winner, round_.finished_at, self.places(round_)), before)
+
+    def test_question_closed_by_answers_before_the_deadline_is_not_found(self):
+        round_ = self.started_round(100)
+        for player in (self.a, self.b, self.c):
+            self.answer(round_, player, 100, at=1)
+
+        self.clock.at(30)
+        self.assertIn('expired questions: 0', self.run_command())
+
+    def test_stale_evaluation_is_a_no_op(self):
+        round_ = self.started_round(100, 50)
+        question = round_.questions.get()
+        self.answer(round_, self.a, 100, at=1)
+        self.clock.at(10)
+        evaluate_question(round_.pk, question_id=question.pk)  # the first process
+        round_.refresh_from_db()
+        finished = round_.finished_at
+
+        # A second process still holding the old "active" copy: the conditional update hits 0 rows.
+        with transaction.atomic():
+            self.assertFalse(rounds._evaluate(round_, question, T0 + timedelta(seconds=40), FirstChoice()))
+        round_.refresh_from_db()
+        self.assertEqual(round_.finished_at, finished)
+        self.assertEqual(round_.questions.count(), 1)
+        with self.assertRaises(RoundStateError):
+            evaluate_question(round_.pk, question_id=question.pk)
+
+    def test_loop_stops_cleanly_on_ctrl_c(self):
+        with mock.patch('games.management.commands.close_expired_rounds.time.sleep', side_effect=KeyboardInterrupt):
+            output = self.run_command('--loop', '--interval', '5')
+
+        self.assertIn('Checking every 5 s', output)
+        self.assertIn('expired questions: 0', output)
+        self.assertTrue(output.rstrip().endswith('Stopped.'))
+
+    def test_interval_must_be_positive(self):
+        with self.assertRaises(CommandError):
+            self.run_command('--loop', '--interval', '0')

@@ -278,3 +278,108 @@ changing operation also locks the round row with `select_for_update()`. On Postg
 attempts on the same round. On SQLite, `transaction_mode: IMMEDIATE` serializes all writers instead (see
 above). `games/tests/test_concurrency.py` runs two real threads and checks that exactly one answer is
 accepted.
+
+## Territory capture and scoring (M07)
+
+`games/capture.py` links the result of a city capture round to territory picks and points.
+`games/scoring.py` holds the scoring systems.
+
+### Flow
+
+1. **Round creation** (`create_round`) is refused while a round is unfinished, while capture picks from
+   the last round are still unused, or when no territory is free (the conquest phase is over; the game
+   itself stays `in_progress`). The number of free territories is stored on the round
+   (`Round.free_territories`) and fixes, before the start, how many places are needed. With 3 or more free
+   it needs 1st and 2nd. With 1 or 2 free it needs only 1st, so no question is asked just to decide 2nd.
+2. **Round completion** (the M06 `_complete`) does three things in the same transaction: it saves the final
+   ranking and the winner, awards the win, and creates the capture rights. Re-evaluating a completed round
+   is refused, so it can add neither rights nor a second award.
+
+   | Free territories at creation | First picks | Second picks (if decided) |
+   |---|---|---|
+   | 3 or more | 2 | 1 |
+   | 2 | 2 | 0 |
+   | 1 | 1 | 0 |
+
+   A round without a winner gives no award and no rights; the territories wait for the next round. If
+   2nd place is unresolved, the first keeps both picks and the third free territory stays for the next round.
+3. **Picks** (`choose_territory(game_id, player_id, territory_id)`) are separate operations. The first player
+   uses all of their picks before the second picks. A pick needs an active game, the player's turn and a
+   free territory of the same game that borders something the player owns (the capital counts). Only
+   when no free territory borders any of their territories may the player pick any free one. Allowed
+   territories are recomputed after every pick, so the first's second pick may border the territory just
+   taken. Each pick does four things in one transaction: change the owner, raise `Territory.score`, credit
+   the capture points and use one pick. A refused pick changes nothing and keeps the right.
+
+### Scoring (chosen system: value-based)
+
+| What | Points |
+|---|---|
+| Round win (1st place) | **+150** to `GamePlayer.score`, once per round, when the round is completed |
+| Territory value | `Territory.score` **+100** per capture (0 → 100 on the first capture) |
+| Capture | the territory's value **after** the increase, i.e. 100 for a first capture |
+
+Follow-up questions in a round give no separate award. Every change is stored in `ScoreEntry` with the
+score before and after, the territory score before and after, and the calculation as text. Database
+constraints guarantee that after = before + points, that points are positive, that a round has one win
+entry, and that a territory has one capture entry. Scores never go down here and never become negative.
+
+### Two systems on the same results
+
+Same results: round 1 ana 1st, boris 2nd, ana picks 2 and boris picks 1; round 2 cveta 1st, 2nd unresolved, cveta picks 2.
+
+| System | Win | Capture | Territory | ana | boris | cveta |
+|---|---|---|---|---|---|---|
+| **A. Value-based (chosen)** | 150 | value after increase (100) | +100 | 150+100+100 = **350** | **100** | 150+100+100 = **350** |
+| B. Rank-based | 50 | 100 for 1st's pick, 60 for 2nd's | +1 | 50+100+100 = **250** | **60** | 50+100+100 = **250** |
+
+Both are defined in `games/scoring.py`. `test_two_scoring_systems_on_the_same_results` checks the numbers above.
+
+**Why A.** The difference between 1st and 2nd comes from what they actually win: 1st gets the win bonus
+and two territories, 2nd gets one territory. A territory is worth the same to whoever takes it,
+because its points come from the territory, not from the rank. Ranking is already rewarded by the
+number of picks, so B rewards rank twice and makes 2nd's territory worth less for no map-related reason.
+In A the capture points follow `Territory.score`, so a territory that gains value later is worth more
+when someone captures it.
+
+### How to run it (real local records)
+
+```bash
+python backend/manage.py numeric_round create <game id>    # then start / answer as in M06
+python backend/manage.py capture show <game id>            # free territories, whose turn, scores
+python backend/manage.py capture pick <game id> <username> <territory slug>
+```
+
+Run on a fresh local database (three users, game initialized by M05):
+
+```
+# Round 1: ana 1885, boris 1880, cveta 1900 (correct 1885) -> places 1: ana, 2: boris
+$ manage.py capture show 1
+ana's turn, 2 pick(s) left; allowed: Zhitno Pole, Zlaten Grozd
+Scores: ana 150, boris 0, cveta 0
+$ manage.py capture pick 1 ana zhitno-pole
+ana took Zhitno Pole: 150 + 100 = 250 (territory 0 + 100 = 100; points = territory value after = 100)
+ana's turn, 1 pick(s) left; allowed: Madara, Zlaten Grozd          <- Madara borders the new territory
+$ manage.py capture pick 1 boris ezera
+CommandError: [invalid_state] It is not this player's turn to pick (waiting for ana).
+$ manage.py capture pick 1 ana zlaten-grozd
+ana took Zlaten Grozd: 250 + 100 = 350 (territory 0 + 100 = 100; points = territory value after = 100)
+$ manage.py capture pick 1 boris ezera
+boris took Ezera: 0 + 100 = 100 (territory 0 + 100 = 100; points = territory value after = 100)
+No picks pending.
+Scores: ana 350, boris 100, cveta 0
+# Round 2: cveta 1990, boris 1970, ana 2000 (correct 1989) -> places 1: cveta, 2: ana
+$ manage.py capture pick 1 cveta balkania
+cveta took Balkania: 150 + 100 = 250 (territory 0 + 100 = 100; points = territory value after = 100)
+Scores: ana 350, boris 100, cveta 250
+```
+
+### Concurrent picks
+
+Every pick locks the game row (`select_for_update`). It then changes the territory and the right only
+with conditional updates: `filter(pk=..., owner__isnull=True).update(...)` and
+`filter(pk=..., used__lt=F('allowed')).update(used=F('used') + 1)`. If either touches 0 rows, another pick
+got there first: the transaction is rolled back and the attempt is refused as `invalid_state`. The unique
+constraint "one capture entry per territory" is a last line of defence. On SQLite the
+`IMMEDIATE` transactions serialize the picks (see M05). `ConcurrentCaptureTests` runs two real
+threads for one free territory and for the last pick, and in both cases exactly one succeeds.
