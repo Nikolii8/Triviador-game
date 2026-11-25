@@ -9,9 +9,12 @@ import threading
 
 from django.db import connection
 from django.test import TransactionTestCase
+from django.utils import timezone
 
 from games.initialization import GameInitializationError, initialize_game
-from games.models import Game, GamePlayer
+from games.models import Game, GamePlayer, RoundAnswer
+from games.rounds import RoundStateError, create_round, start_round, submit_answer
+from questions.models import Category, NumericQuestion
 from territories.map_definition import PROJECT_MAP
 from territories.models import Capital, Territory
 
@@ -64,7 +67,9 @@ class ConcurrentInitializationTests(TransactionTestCase):
 
         results = run_simultaneously(
             lambda: initialize_game(self.game.pk),
-            lambda: GamePlayer.objects.create(game=self.game, user=make_user('racer'), player_order=2),
+            lambda: GamePlayer.objects.create(
+                game=self.game, user=make_user('racer'), player_order=2, color='blue'
+            ),
         )
 
         self.game.refresh_from_db()
@@ -78,3 +83,27 @@ class ConcurrentInitializationTests(TransactionTestCase):
             self.assertIsInstance(results[0], GameInitializationError)
             self.assertEqual(player_count, 3)
             self.assertFalse(Territory.objects.filter(game=self.game).exists())
+
+
+class ConcurrentAnswerTests(TransactionTestCase):
+    """M06 upgrade: two simultaneous answers from one player to one question."""
+
+    def test_only_one_answer_is_accepted(self):
+        game = make_game(make_user('host'))
+        players = [add_player(game, f'p{order}', order) for order in (1, 2, 3)]
+        Game.objects.filter(pk=game.pk).update(status=Game.IN_PROGRESS, started_at=timezone.now())
+        category = Category.objects.create(name='Числа')
+        NumericQuestion.objects.create(category=category, text='Колко?', correct_answer=10)
+        round_ = create_round(game.pk)
+        start_round(round_.pk)
+
+        results = run_simultaneously(
+            lambda: submit_answer(round_.pk, players[0].pk, 10),
+            lambda: submit_answer(round_.pk, players[0].pk, 11),
+        )
+
+        accepted = [result for result in results if isinstance(result, RoundAnswer)]
+        refused = [result for result in results if isinstance(result, RoundStateError)]
+        self.assertEqual((len(accepted), len(refused)), (1, 1), results)
+        stored = RoundAnswer.objects.get(round=round_, player=players[0])
+        self.assertEqual(stored.numeric_value, accepted[0].numeric_value)

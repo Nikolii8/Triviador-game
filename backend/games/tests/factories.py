@@ -1,6 +1,6 @@
 from django.contrib.auth import get_user_model
 
-from games.models import Game, GamePlayer, Round
+from games.models import PLAYER_COLORS, Game, GamePlayer, Round
 from questions.models import AnswerOption, Category, ChoiceQuestion, NumericQuestion
 
 User = get_user_model()
@@ -16,7 +16,9 @@ def make_game(creator=None, **fields):
 
 
 def add_player(game, username, order):
-    return GamePlayer.objects.create(game=game, user=make_user(username), player_order=order)
+    # A distinct color per seat, since a game allows each color only once.
+    color = PLAYER_COLORS[(order - 1) % len(PLAYER_COLORS)][0]
+    return GamePlayer.objects.create(game=game, user=make_user(username), player_order=order, color=color)
 
 
 def make_choice_question(text='Коя е столицата на Австралия?'):

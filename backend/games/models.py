@@ -57,6 +57,10 @@ class Game(models.Model):
     def __str__(self) -> str:
         return f'Game #{self.pk} ({self.get_status_display()})'
 
+    def get_current_round(self):
+        """The round with the highest number, or None if the game has no rounds yet."""
+        return self.rounds.order_by('-number').first()
+
     def clean(self):
         super().clean()
         if self.status in (self.IN_PROGRESS, self.FINISHED) and self.started_at is None:
@@ -141,6 +145,8 @@ class WaitingRoom(models.Model):
 
 
 class Round(models.Model):
+    # M06 uses PENDING -> OPEN -> EVALUATED (the milestone's pending -> active -> completed).
+    # CLOSED stays available from M03 but the numeric round workflow does not use it.
     PENDING = 'pending'
     OPEN = 'open'
     CLOSED = 'closed'
@@ -161,9 +167,30 @@ class Round(models.Model):
         (NUMERIC, 'Numeric'),
     ]
 
+    # Kind of round (M06). Blank for plain M03 rounds that are not run by games.rounds.
+    CITY_CAPTURE = 'city_capture'
+
+    ROUND_TYPE_CHOICES = [
+        (CITY_CAPTURE, 'City capture'),
+    ]
+
+    # Why a completed round has places without a player.
+    NOT_ENOUGH_ANSWERS = 'not_enough_answers'
+    QUESTION_LIMIT = 'question_limit'
+    BANK_EXHAUSTED = 'bank_exhausted'
+
+    UNRESOLVED_REASON_CHOICES = [
+        (NOT_ENOUGH_ANSWERS, 'Not enough accepted answers'),
+        (QUESTION_LIMIT, 'Question limit reached'),
+        (BANK_EXHAUSTED, 'No unused numeric question left'),
+    ]
+
     game = models.ForeignKey(Game, on_delete=models.CASCADE, related_name='rounds')
     number = models.PositiveIntegerField()
     status = models.CharField(max_length=20, choices=ROUND_STATUS_CHOICES, default=PENDING)
+    round_type = models.CharField(max_length=20, choices=ROUND_TYPE_CHOICES, blank=True, default='')
+    # How many places the round decides (1st, 2nd, ...). Fixed when the round is created.
+    places_needed = models.PositiveSmallIntegerField(null=True, blank=True)
     # Kept in sync automatically in save(): it is derived from whichever question is set,
     # never entered by hand, so it cannot disagree with the question.
     question_type = models.CharField(max_length=20, choices=QUESTION_TYPE_CHOICES, editable=False)
@@ -174,6 +201,7 @@ class Round(models.Model):
         on_delete=models.PROTECT,
         related_name='rounds',
     )
+    # For a numeric round this is the first question asked; follow-ups live in RoundQuestion.
     numeric_question = models.ForeignKey(
         NumericQuestion,
         null=True,
@@ -182,7 +210,18 @@ class Round(models.Model):
         related_name='rounds',
     )
     started_at = models.DateTimeField(null=True, blank=True)
+    # The milestone's completed_at.
     finished_at = models.DateTimeField(null=True, blank=True)
+    winner = models.ForeignKey(
+        GamePlayer,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name='won_rounds',
+    )
+    unresolved_reason = models.CharField(
+        max_length=30, choices=UNRESOLVED_REASON_CHOICES, blank=True, default=''
+    )
 
     class Meta:
         ordering = ['game', 'number']
@@ -203,6 +242,24 @@ class Round(models.Model):
                 name='round_question_matches_type',
             ),
             _finished_after_started('round'),
+            # A winner and a reason only exist once the round is evaluated.
+            models.CheckConstraint(
+                condition=Q(winner__isnull=True) | Q(status='evaluated'),
+                name='round_winner_only_when_evaluated',
+            ),
+            models.CheckConstraint(
+                condition=Q(unresolved_reason='') | Q(status='evaluated'),
+                name='round_reason_only_when_evaluated',
+            ),
+            # An evaluated city capture has a finish time, and a winner unless a reason says why not.
+            models.CheckConstraint(
+                condition=~Q(round_type='city_capture', status='evaluated', finished_at__isnull=True),
+                name='round_city_capture_evaluated_has_finish_time',
+            ),
+            models.CheckConstraint(
+                condition=~Q(round_type='city_capture', status='evaluated', winner__isnull=True, unresolved_reason=''),
+                name='round_city_capture_no_winner_needs_reason',
+            ),
         ]
 
     def __str__(self) -> str:
@@ -211,6 +268,10 @@ class Round(models.Model):
     @property
     def question(self):
         return self.choice_question if self.choice_question_id is not None else self.numeric_question
+
+    def ranking(self):
+        """The decided places so far, as answers ordered by place."""
+        return self.answers.filter(place__isnull=False).select_related('player__user').order_by('place')
 
     def _sync_question_type(self):
         """Set question_type from the question; return False if there is not exactly one question."""
@@ -231,6 +292,27 @@ class Round(models.Model):
         if not self._sync_question_type():
             raise ValidationError('A round must have exactly one question: either a choice or a numeric one.')
 
+        evaluated = self.status == self.EVALUATED
+        if self.winner_id is not None:
+            if not evaluated:
+                raise ValidationError({'winner': 'Only an evaluated round has a winner.'})
+            if self.winner.game_id != self.game_id:
+                raise ValidationError({'winner': 'The winner must be a player of the same game.'})
+        if self.unresolved_reason and not evaluated:
+            raise ValidationError({'unresolved_reason': 'Only an evaluated round can have unresolved places.'})
+
+        if self.round_type == self.CITY_CAPTURE:
+            if self.question_type != self.NUMERIC:
+                raise ValidationError('A city capture round uses a numeric question.')
+            if not self.places_needed:
+                raise ValidationError({'places_needed': 'A city capture round must fix how many places it decides.'})
+            if evaluated and self.finished_at is None:
+                raise ValidationError({'finished_at': 'An evaluated round must have a completion time.'})
+            if evaluated and self.winner_id is None and not self.unresolved_reason:
+                raise ValidationError(
+                    {'unresolved_reason': 'A round completed without a winner must say why first place is unresolved.'}
+                )
+
     def save(self, *args, **kwargs):
         if self._sync_question_type():
             update_fields = kwargs.get('update_fields')
@@ -239,9 +321,86 @@ class Round(models.Model):
         super().save(*args, **kwargs)
 
 
+class RoundQuestion(models.Model):
+    """One numeric question asked within a round: the first one, or a tie-break / retry for a group.
+
+    The question's text and correct answer are copied when it is asked, so later edits in the
+    question bank do not change what was asked or how it is scored.
+    """
+
+    PENDING = 'pending'
+    ACTIVE = 'active'
+    COMPLETED = 'completed'
+
+    STATUS_CHOICES = [
+        (PENDING, 'Pending'),
+        (ACTIVE, 'Active'),
+        (COMPLETED, 'Completed'),
+    ]
+
+    round = models.ForeignKey(Round, on_delete=models.CASCADE, related_name='questions')
+    sequence = models.PositiveSmallIntegerField()
+    numeric_question = models.ForeignKey(
+        NumericQuestion,
+        on_delete=models.PROTECT,
+        related_name='round_questions',
+    )
+    text = models.TextField()
+    correct_answer = models.IntegerField()
+    participants = models.ManyToManyField(GamePlayer, related_name='round_questions')
+    # The places this question decides, e.g. 1-2 for the first question or 2-2 for a tie for second.
+    first_place = models.PositiveSmallIntegerField()
+    last_place = models.PositiveSmallIntegerField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=PENDING)
+    started_at = models.DateTimeField(null=True, blank=True)
+    deadline = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['round', 'sequence']
+        constraints = [
+            models.UniqueConstraint(fields=['round', 'sequence'], name='roundquestion_unique_sequence'),
+            models.UniqueConstraint(
+                fields=['round', 'numeric_question'], name='roundquestion_unique_bank_question_per_round'
+            ),
+            models.CheckConstraint(condition=Q(sequence__gte=1, sequence__lte=3), name='roundquestion_sequence_range'),
+            models.CheckConstraint(
+                condition=Q(first_place__gte=1, last_place__gte=F('first_place')),
+                name='roundquestion_place_range',
+            ),
+            models.CheckConstraint(
+                condition=Q(status__in=['pending', 'active', 'completed']),
+                name='roundquestion_status_valid',
+            ),
+            # An asked question has its start and deadline; a pending one has neither.
+            models.CheckConstraint(
+                condition=(
+                    Q(status='pending', started_at__isnull=True, deadline__isnull=True)
+                    | (~Q(status='pending') & Q(started_at__isnull=False, deadline__gt=F('started_at')))
+                ),
+                name='roundquestion_timing_matches_status',
+            ),
+            models.CheckConstraint(
+                condition=Q(completed_at__isnull=True) | Q(status='completed'),
+                name='roundquestion_completed_at_only_when_completed',
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f'Question {self.sequence} of round {self.round.number} (game #{self.round.game_id})'
+
+
 class RoundAnswer(models.Model):
     round = models.ForeignKey(Round, on_delete=models.CASCADE, related_name='answers')
     player = models.ForeignKey(GamePlayer, on_delete=models.CASCADE, related_name='answers')
+    # Set for answers given in a numeric round run by games.rounds (M06): the question answered.
+    question = models.ForeignKey(
+        RoundQuestion,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name='answers',
+    )
     selected_option = models.ForeignKey(
         AnswerOption,
         null=True,
@@ -253,15 +412,32 @@ class RoundAnswer(models.Model):
     is_correct = models.BooleanField(null=True, blank=True)
     points_awarded = models.IntegerField(default=0)
     submitted_at = models.DateTimeField(null=True, blank=True)
+    # The place in the round's ranking this answer earned, if any.
+    place = models.PositiveSmallIntegerField(null=True, blank=True)
 
     class Meta:
         ordering = ['round', 'player__player_order']
         constraints = [
-            models.UniqueConstraint(fields=['round', 'player'], name='roundanswer_unique_player_per_round'),
+            # Plain rounds: one answer per player. Numeric rounds: one answer per player per question.
+            models.UniqueConstraint(
+                fields=['round', 'player'],
+                condition=Q(question__isnull=True),
+                name='roundanswer_unique_player_per_round',
+            ),
+            models.UniqueConstraint(fields=['question', 'player'], name='roundanswer_unique_player_per_question'),
+            models.UniqueConstraint(
+                fields=['round', 'place'],
+                condition=Q(place__isnull=False),
+                name='roundanswer_unique_place_per_round',
+            ),
             # An answer holds a selected option or a number, never both (neither = not answered yet).
             models.CheckConstraint(
                 condition=Q(selected_option__isnull=True) | Q(numeric_value__isnull=True),
                 name='roundanswer_single_answer_kind',
+            ),
+            models.CheckConstraint(
+                condition=Q(place__isnull=True) | Q(question__isnull=False, place__gte=1),
+                name='roundanswer_place_needs_question',
             ),
         ]
 
@@ -274,6 +450,11 @@ class RoundAnswer(models.Model):
             return
         if self.player.game_id != self.round.game_id:
             raise ValidationError({'player': 'The player must belong to the same game as the round.'})
+        if self.question_id is not None:
+            if self.question.round_id != self.round_id:
+                raise ValidationError({'question': 'The question must belong to the same round.'})
+            if not self.question.participants.filter(pk=self.player_id).exists():
+                raise ValidationError({'player': 'Only a participant of the question can answer it.'})
 
         if self.round.question_type == Round.CHOICE:
             if self.numeric_value is not None:

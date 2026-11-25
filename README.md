@@ -164,3 +164,117 @@ write lock when it begins, so attempts run strictly one after another. This is c
 `database is locked` after the 20 s `timeout`. The concurrency tests (`games/tests/test_concurrency.py`)
 run real threads against a file-based SQLite test database; they would need re-running on PostgreSQL to
 confirm the row-lock behaviour there.
+
+## Numeric rounds (M06)
+
+`games/rounds.py` is the service layer for one numeric **city capture** round of an active game. Every
+operation runs in one transaction: it either applies all of its changes or raises an error and changes nothing.
+
+| Operation | What it does |
+|---|---|
+| `create_round(game_id)` | Next round number (highest existing + 1), random unused numeric question, all 3 players, status `pending`. No timer yet. |
+| `start_round(round_id)` | `pending` → `open`: the first question gets a common start and a deadline 10 s later. |
+| `submit_answer(round_id, player_id, value)` | Records one whole-number answer. When every participant has answered, the question is evaluated at once. |
+| `evaluate_question(round_id)` | Evaluates the active question without a new answer. Refused while time is left and someone has not answered. |
+| `round_state(round_id)` | Read-only: current question, deadline, seconds left, answers, ranking and winner, as plain data. |
+
+The milestone's round statuses `pending → active → completed` are stored as the M03 statuses
+`pending → open → evaluated` (`closed` is not used by this workflow), and `completed_at` is `Round.finished_at`.
+`Game.get_current_round()` returns the round with the highest number.
+
+### Rules
+
+- **Time.** The server reads the clock (`games.rounds.now()`) as soon as an answer comes in, before the
+  deadline check, and uses that same moment to rank speed. The client never sends a timestamp. An answer
+  at `started_at + 10 s` or later is refused. Times are not rounded to whole seconds.
+- **Answers.** One answer per player per question. A wrong or invalid attempt (`"3.5"`, `3.5`, `"abc"`,
+  `True`, out of range) is rejected and the player can still answer. A second answer never replaces the
+  first, and a player who doesn't answer is not counted as having answered 0.
+- **Ranking.** Smaller distance from the correct answer wins. At equal distance the faster answer wins,
+  even when the two answers are on opposite sides of the correct one. A city capture round decides
+  places 1 and 2 (`places_needed = 2`, fixed when the round is created). With only one answer there is
+  only a first place.
+- **Follow-up questions.** If players tie exactly (same distance and same moment) for a needed place, a
+  new question goes only to the tied group. If nobody answered, a new question goes to the same group.
+  Places already decided are kept, and answers to different questions are never compared. A round
+  asks at most 3 questions, and each new one gets its own 10 s from the moment it is activated.
+  Closing one question and asking the next happen in one transaction.
+- **Ending.** When the result is decided, the round becomes `evaluated` with `finished_at` and its place-1
+  player as `winner`. Unfilled places get a recorded `unresolved_reason`:
+  `question_limit` (3 questions used; this reason wins if the bank is also empty), `bank_exhausted`, or
+  `not_enough_answers`. A round without a winner is valid only with a reason, which the model validation
+  and database constraints both enforce. An evaluated round is never re-evaluated.
+- **Questions** are never repeated within a game. A round's text and correct answer are copied
+  when it is asked, so editing the question bank later changes neither the history nor the scoring.
+
+### Errors
+
+Every refusal is a subclass of `games.rounds.RoundError` (a `ValidationError`). Its class and `kind`
+tell the caller why the request was refused:
+
+| Class | `kind` | Example from the project |
+|---|---|---|
+| `InvalidRoundInput` | `invalid_input` | `submit_answer(r, p, "1886.5")` → *The answer must be a whole number (got '1886.5').* |
+| `RoundStateError` | `invalid_state` | a second answer → *This player has already answered this question.* |
+| `RoundNotFound` | `not_found` | `submit_answer(999999, p, 1)` → *Round #999999 does not exist.* |
+
+### How to run it
+
+The game must already be initialized (M05) and the question bank must have numeric questions.
+
+```bash
+python backend/manage.py numeric_round create <game id>
+python backend/manage.py numeric_round start <round id>
+python backend/manage.py numeric_round answer <round id> <username> <number>   # within 10 s
+python backend/manage.py numeric_round evaluate <round id>                     # after the deadline
+python backend/manage.py numeric_round show <round id>
+```
+
+On Windows, set `PYTHONIOENCODING=utf-8` so the Cyrillic question text prints. Real run with three
+users (ana, boris, cveta) on an initialized game:
+
+```
+$ manage.py numeric_round answer 1 ana 1880
+Answer accepted.
+$ manage.py numeric_round answer 1 ana 1885
+CommandError: [invalid_state] This player has already answered this question.
+$ manage.py numeric_round answer 1 boris 1886.5
+CommandError: [invalid_input] The answer must be a whole number (got '1886.5').
+$ manage.py numeric_round evaluate 1
+CommandError: [invalid_state] The question is still running: not everyone has answered and time is not up.
+$ manage.py numeric_round answer 1 boris 1890
+$ manage.py numeric_round answer 1 cveta 1885
+Round 1 of game #1: evaluated
+  Q1 [completed] През коя година е Съединението на България?  players: ana, boris, cveta
+      ana: 1880  (correct 1885)
+      boris: 1890  (correct 1885)
+      cveta: 1885  (correct 1885)
+  Place 1: cveta
+  Place 2: ana
+  Winner: cveta
+```
+
+Ana and Boris are both 5 away from the correct answer, so Ana's earlier answer takes 2nd place.
+
+### Data decision
+
+**Chosen:** a separate `RoundQuestion` row for every question asked in a round. It stores a snapshot of
+the text and correct answer, its group of players, the places it decides, its start and deadline.
+`RoundAnswer` is reused with a `question` link and the `place` the answer earned. The ranking is just
+the answers that have a place, so a reload rebuilds the current question, the time left and the ranking
+from stored rows alone, and the full history of tie-breaks is kept.
+
+**Rejected:** creating a new `Round` for each tie-break question. It would reuse the M03 model as is,
+but the milestone says follow-up questions keep the round's number, and round numbers are unique
+per game. The "at most 3 questions" and "only the tied group answers" rules would also have to span
+several rounds.
+
+### Two simultaneous answers from one player
+
+The unique constraint `(question, player)` on `RoundAnswer` guarantees at most one stored answer at the
+database level, on any database. If two attempts get past the "already answered?" check at the same
+moment, the second insert fails and is reported as `RoundStateError`, never as a server error. Every
+changing operation also locks the round row with `select_for_update()`. On PostgreSQL that serializes
+attempts on the same round. On SQLite, `transaction_mode: IMMEDIATE` serializes all writers instead (see
+above). `games/tests/test_concurrency.py` runs two real threads and checks that exactly one answer is
+accepted.

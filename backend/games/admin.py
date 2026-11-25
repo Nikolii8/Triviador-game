@@ -3,7 +3,7 @@ from django.contrib import admin, messages
 from territories.models import Capital, Territory
 
 from .initialization import GameInitializationError, initialize_game
-from .models import Game, GamePlayer, Round, RoundAnswer
+from .models import Game, GamePlayer, Round, RoundAnswer, RoundQuestion
 
 
 class GamePlayerInline(admin.TabularInline):
@@ -32,7 +32,20 @@ class RoundInline(admin.TabularInline):
 class RoundAnswerInline(admin.TabularInline):
     model = RoundAnswer
     extra = 0
-    raw_id_fields = ('player', 'selected_option')
+    raw_id_fields = ('player', 'question', 'selected_option')
+
+
+class RoundQuestionInline(admin.TabularInline):
+    """Questions asked in a numeric round: history only, changed through games.rounds."""
+
+    model = RoundQuestion
+    extra = 0
+    fields = ('sequence', 'status', 'text', 'correct_answer', 'first_place', 'last_place', 'started_at', 'deadline')
+    readonly_fields = fields
+    can_delete = False
+
+    def has_add_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(Game)
@@ -76,18 +89,18 @@ class GamePlayerAdmin(admin.ModelAdmin):
 
 @admin.register(Round)
 class RoundAdmin(admin.ModelAdmin):
-    list_display = ('__str__', 'game', 'number', 'status', 'question_type')
-    list_filter = ('status', 'question_type')
+    list_display = ('__str__', 'game', 'number', 'round_type', 'status', 'question_type', 'winner')
+    list_filter = ('status', 'question_type', 'round_type')
     readonly_fields = ('question_type',)
-    raw_id_fields = ('game',)
+    raw_id_fields = ('game', 'winner')
     autocomplete_fields = ('choice_question', 'numeric_question')
-    list_select_related = ('game',)
-    inlines = [RoundAnswerInline]
+    list_select_related = ('game', 'winner__user')
+    inlines = [RoundQuestionInline, RoundAnswerInline]
 
 
 @admin.register(RoundAnswer)
 class RoundAnswerAdmin(admin.ModelAdmin):
-    list_display = ('__str__', 'round', 'player', 'is_correct', 'points_awarded', 'submitted_at')
+    list_display = ('__str__', 'round', 'player', 'numeric_value', 'place', 'is_correct', 'submitted_at')
     list_filter = ('is_correct', 'round__question_type')
-    raw_id_fields = ('round', 'player', 'selected_option')
+    raw_id_fields = ('round', 'player', 'question', 'selected_option')
     list_select_related = ('round', 'player__user')
